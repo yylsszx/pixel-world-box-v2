@@ -1,0 +1,75 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+.next-*/
+.api-stash-export/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+
+# vercel
+.vercel
+
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+local-*
+.claude
+.z-ai-config
+*.log
+dev.log
+dev.out.log
+test
+prompt
+
+server.log
+# 运行时状态（Task 76）：pid/lock/rate 是本机运行时状态，进 git 会让部署
+# 环境拿到陈旧 pid → watchdog 误判「已在运行」拒绝启动（演练实测踩坑）
+.zscripts/*.pid
+.zscripts/*.lock
+.zscripts/*.rate
+# Skills directory
+/skills/tool-results/
+# dotnet 编译产物（Task 133 重清理：obj-core/obj-tests 沙箱回滚后复发跟踪）
+unity/pixel-world-box/obj-core/
+unity/pixel-world-box/obj-tests/
+unity/pixel-world-box/bin/
+unity/pixel-world-box/bin-tests/
+# 沙箱工具临时产物
+/tool-results/
+
+# dsh 基线源码池（314MB 纪律：只留沙箱本地，永不入库；ORACLE_V2 §8）
+/third_party/
+oracle-server/dsh-runtime/
+
+# dotnet 持久工具链（沙箱重置免重装；M-U28 起 .dotnet 挂项目内）
+/.dotnet/

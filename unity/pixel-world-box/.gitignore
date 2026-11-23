@@ -1,0 +1,27 @@
+# Unity generated
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Uu]nityGenerated/
+*.pidb.meta
+*.pdb.meta
+*.mdb.meta
+
+# Build results
+[Bb]uild/
+[Bb]uilds/
+[Bb]in/
+bin-tests/
+*.sln
+
+# BUT keep our dotnet verification csproj (T1/T2 工程壳)
+!Wb.Core.csproj
+!Wb.Tests.csproj
+
+# Unity crash reports
+sysinfo.txt
+*.stackdump
+
+# OS junk
+.DS_Store
+Thumbs.db

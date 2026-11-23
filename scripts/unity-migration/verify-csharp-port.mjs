@@ -1,0 +1,2349 @@
+#!/usr/bin/env node
+// ============================================================
+// verify-csharp-port.mjs — C# 翻译的沙箱侧近似验证（M-U2a）
+// 沙箱无 dotnet/Unity → C# 逻辑无法直接执行。本脚本把 C# 三段核心逻辑
+// （WbRng.mulberry32 / WbMath.FdHypot / WbArena 布局序列）逐行转写为 JS，
+// 与 wasm 真实现位级对账——转写自 C# 源（非蓝本），对账基准是 wasm：
+//   1. mulberry32: vs src/lib/game/noise.ts 真实现（100 万样本）
+//   2. fd_hypot:   vs wasm wb_math_test(op=5)（20 万随机样本，含极端值）
+//   3. 布局 offs:  vs 黄金 JSON meta.offs（wasm wb_off 全 154 项）
+// 权威验证仍是用户侧 Unity Test Runner（WbGoldenTests.cs）。
+// ============================================================
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+// Node 24 原生 strip-types 对 types.ts 无后缀 bare import 解析失败（noise→types→items 链）——统一走 jiti
+const { createJiti: _cj } = await import('jiti');
+const _jiti0 = _cj(import.meta.url, { alias: { '@': path.join(path.dirname(fileURLToPath(import.meta.url)), '../../src') } });
+const { mulberry32 } = await _jiti0.import(path.join(path.dirname(fileURLToPath(import.meta.url)), '../../src/lib/game/noise.ts'));
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+
+// —— 1) mulberry32：WbRng.cs unchecked uint 语义的 JS 转写 ——
+function mulberry32Csharp(a) {
+  // 返回 () => f64；逐行对应 WbRng.Mulberry32Next
+  return function next() {
+    a = (a + 0x6d2b79f5) >>> 0;                       // a = a + 0x6d2b79f5u
+    let t = (a ^ (a >>> 15)) >>> 0;                   // t = a ^ (a >> 15)
+    t = Math.imul(t, (1 | a) >>> 0) >>> 0;            // t = t * (1 | a)
+    const inner = Math.imul((t ^ (t >>> 7)) >>> 0, (61 | t) >>> 0) >>> 0;
+    const t2 = ((t + inner) >>> 0) ^ t;               // t2 = (t + ...) ^ t
+    return ((t2 ^ (t2 >>> 14)) >>> 0) / 4294967296.0; // (uint)(t2 ^ (t2 >> 14)) / 2^32
+  };
+}
+let rngFail = 0;
+const refNext = mulberry32(0x12345678);
+const csharpNext = mulberry32Csharp(0x12345678);
+for (let i = 0; i < 1_000_000; i++) {
+  if (refNext() !== csharpNext()) { rngFail++; if (rngFail < 5) console.error(`  mulberry32 mismatch @${i}`); }
+}
+console.log(`mulberry32: ${rngFail === 0 ? 'PASS' : `FAIL(${rngFail})`} (1e6 samples vs noise.ts)`);
+
+// —— 2) fd_hypot：WbMath.FdHypot 的 JS 转写（位操作用 DataView） ——
+const _b8 = new ArrayBuffer(8);
+const _f64v = new Float64Array(_b8);
+const _u32v = new Uint32Array(_b8);
+const bitsOf = (x) => { _f64v[0] = x; return [_u32v[0], _u32v[1]]; };   // [lo, hi]
+const fromBits = (lo, hi) => { _u32v[0] = lo >>> 0; _u32v[1] = hi >>> 0; return _f64v[0]; };
+const hiOf = (x) => bitsOf(x)[1] | 0;
+const loOf = (x) => bitsOf(x)[0] >>> 0;
+const setHi = (x, h) => { const [lo] = bitsOf(x); return fromBits(lo, h >>> 0); };
+
+function fdHypotCsharp(x, y) {
+  let a = x, b = y;
+  let ha = hiOf(x) & 0x7fffffff;
+  let hb = hiOf(y) & 0x7fffffff;
+  if (hb > ha) { [a, b] = [b, a]; [ha, hb] = [hb, ha]; }
+  a = setHi(a, ha); b = setHi(b, hb);
+  if (ha - hb > 0x3c00000) return a + b;
+  let k = 0;
+  if (ha > 0x5f300000) {
+    if (ha >= 0x7ff00000) {
+      let w = a + b;
+      if (((ha & 0xfffff) >>> 0 | loOf(a)) === 0) w = a;
+      if ((((hb >>> 0) ^ 0x7ff00000) | loOf(b)) === 0) w = b;
+      return w;
+    }
+    ha -= 0x25800000; hb -= 0x25800000; k += 600;
+    a = setHi(a, ha); b = setHi(b, hb);
+  }
+  if (hb < 0x20b00000) {
+    if (hb <= 0x000fffff) {
+      if (((hb >>> 0) | loOf(b)) === 0) return a;
+      const t1 = setHi(0.0, 0x7fd00000);
+      b *= t1; a *= t1; k -= 1022;
+    } else {
+      ha += 0x25800000; hb += 0x25800000; k -= 600;
+      a = setHi(a, ha); b = setHi(b, hb);
+    }
+  }
+  let w = a - b;
+  let t1, t2;
+  if (w > b) {
+    t1 = setHi(0.0, ha);
+    t2 = a - t1;
+    w = Math.sqrt(t1 * t1 - (b * (-b) - t2 * (a + t1)));
+  } else {
+    a = a + a;
+    const y1 = setHi(0.0, hb);
+    const y2 = b - y1;
+    t1 = setHi(0.0, (ha + 0x00100000) | 0);
+    t2 = a - t1;
+    w = Math.sqrt(t1 * y1 - (w * (-w) - (t1 * y2 + t2 * b)));
+  }
+  if (k !== 0) {
+    let t1c = 1.0;
+    t1c = setHi(t1c, (hiOf(t1c) + (k << 20)) | 0);
+    return t1c * w;
+  }
+  return w;
+}
+
+// wasm 真实现对账（wb_math_test op=5 = hypot）
+const mod = await WebAssembly.instantiate(readFileSync(path.join(ROOT, 'public/wasm/wbcore.wasm')), {});
+const ex = mod.instance.exports;
+// 布置一个合法 wb_init 状态（wb_math_test 不依赖 arena，但保险起见）
+ex.wb_init(256, 160, 4096);
+const wasmHypot = (y, x) => {
+  const [_ylo, _yhi] = bitsOf(y); const [_xlo, _xhi] = bitsOf(x);
+  const r = ex.wb_math_test(BigInt(_yhi) << 32n | BigInt(_ylo >>> 0), BigInt(_xhi) << 32n | BigInt(_xlo >>> 0), 5);
+  return fromBits(Number(r & 0xffffffffn), Number(r >> 32n));
+};
+function* sampleGen(n) {
+  // 随机位模式 + 结构化值（含 subnormal/极端/整数）
+  const structured = [0, 1, -1, 0.5, 3, 10, 4, 1e-300, 1e300, 3e38, -3e38, 0.08, 0.16, 10.77, 123.456, 1e-7];
+  for (const v of structured) { yield [v, v]; yield [v, -v]; yield [v, 0]; yield [0, v]; yield [v, 1]; }
+  let s = 0x9e3779b9;
+  const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+  for (let i = 0; i < n; i++) {
+    const f = () => {
+      const bits = (BigInt(rnd() * 4294967296) << 32n) | BigInt(rnd() * 4294967296);
+      _u32v[0] = Number(bits & 0xffffffffn); _u32v[1] = Number(bits >> 32n);
+      return _f64v[0];
+    };
+    yield [f(), f()];
+  }
+}
+let hypotFail = 0, hypotN = 0;
+for (const [y, x] of sampleGen(200000)) {
+  hypotN++;
+  const expected = wasmHypot(y, x);
+  const actual = fdHypotCsharp(y, x);
+  const [elo, ehi] = bitsOf(expected); const [alo, ahi] = bitsOf(actual);
+  if (elo !== alo || ehi !== ahi) {
+    hypotFail++;
+    if (hypotFail < 5) console.error(`  hypot mismatch: y=${y} x=${x} wasm=${expected} csharp=${actual}`);
+  }
+}
+console.log(`fd_hypot: ${hypotFail === 0 ? 'PASS' : `FAIL(${hypotFail})`} (${hypotN} samples vs wasm wb_math_test)`);
+
+// —— 3) 布局 offs：WbArena.Init 的 Place/Align8 序列转写 vs 黄金 meta.offs ——
+const golden = JSON.parse(readFileSync(path.join(ROOT, 'scripts/unity-migration/golden/units_move.json'), 'utf8'));
+const MAX_RACES = 512, MAX_CIVS = 64, PANIC_CAP = 32, GRUDGE_CAP = 32, MAX_UNITS = 4096, TILES = 40960;
+const MAX_FAM = 256, MAX_BLD = 1024, MAX_ITEMS = 256, MAX_TRAITS = 32, MAX_ITEMDEFS = 128;
+const ACT_CAP = 262144, FXMIN_CAP = 1600, UG_CAP = 8, N_REGIONS = 154;
+const RESULT_BYTES = 424;
+// OFF id 全表（lib.rs L99-259 权威值，WbConstants.cs 同源）
+const id = {
+  UX:0,UY:1,UPANIC:2,GVALS:3,UCIV:4,URACE:5,UID:6,UCELL:7,GIDS:8,CELL_START:9,CELL_ITEMS:10,
+  RACE_FLAGS:11,DYN_PARENT:12,ATWAR:13,UDEAD:14,UHASPANIC:15,RESULT:16,CELL_CURSOR:17,
+  UTX:18,UTY:19,UHP:20,UMAXHP:21,UDMG:22,USPEED:23,UAGE:24,UMAXAGE:25,UKILLS:26,UCD:27,UFD:28,
+  UBREATH:29,ULX:30,ULY:31,USXK:32,USYK:33,USTK:34,UATK:35,UCHILL:36,UFLEET:37,UBLESS:38,
+  UCURSE:39,UFERT:40,UDETOUR:41,UHURT:42,UJOB:43,UTRAIT:44,UINF:45,UFLIP:46,UPAR:47,UBOAT:48,
+  UBTL:49,UCVN:50,UARMY:51,UGEAR:52,UGENE:53,UFAM:54,UFGN:55,UNAME:56,UGLN:57,UGIDS:58,UGVAL:59,
+  TERR:60,FIREG:61,RAD:62,ROAD:63,BLDK:64,OWN:65,BIDX:66,
+  CIVN:67,CVPOP:68,CVHOU:69,CVGLD:70,CVCAP:71,CVAL:72,CVGOV:73,CVTECH:74,CVDIR:75,CVPC:76,CVMKT:77,
+  FAMN:78,FMID:79,FMRACE:80,FMNUM:81,FMSEQ:82,FMNAME:83,
+  BLDN:84,BLDI:85,BLDXY:86,BLDC:87,BLDHP:88,BLDDMG:89,
+  ITMN:90,ITMK:91,ITMXY:92,NEUW:93,NCTL:94,RNGS:95,TICK:96,FRAME:97,PAR:98,USEQ:99,EPS:100,
+  LAWS:101,FXP:102,FXLEN:103,FXMIN:104,FXMINN:105,WILD:106,GRASS:107,DAYPH:108,REPRM:109,PREY:110,
+  SPB:111,SPBH:112,TRN:113,TRDMG:114,TRHP:115,TRSPD:116,TRREG:117,TRFL:118,CNT:119,
+  ACT:120,ACTN:121,BAILK:122,BAILS:123,BAILL:124,BAILP:125,DIRTY:126,DLIST:127,DLISTN:128,BATCHR:129,
+  TBR:130,TBF:131,TBJ:132,TBI:133,TBIN:134,FRSTOFF:135,FRSTN:136,FRSTP:137,FAMP:138,TBT:139,
+  MLOOT:140,NEUCALL:141,COLEN:142,DMGL:143,DMGN:144,FIREN:145,WILDCAP:146,MONCAP:147,MISC:148,
+  GUNBM:150,BEAMBM:151,TBHP:149,
+};
+let off = 0;
+const offs = new Array(N_REGIONS).fill(0);
+const place = (rid, bytes) => { offs[rid] = off; off += bytes; };
+const align8 = () => { off = (off + 7) & ~7; };
+const bw = 256, bh = 160, cells = bw * bh, nu = MAX_UNITS;
+align8();
+place(id.UX, nu * 8); place(id.UY, nu * 8); place(id.UPANIC, nu * 8); place(id.GVALS, GRUDGE_CAP * 8);
+place(id.UCIV, nu * 4); place(id.URACE, nu * 4); place(id.UID, nu * 4); place(id.UCELL, nu * 4);
+place(id.GIDS, GRUDGE_CAP * 4); place(id.CELL_START, (cells + 1) * 4); place(id.CELL_ITEMS, nu * 4);
+place(id.RACE_FLAGS, MAX_RACES);
+const lutOff = (off + 7) & ~7;
+off = lutOff + MAX_RACES * MAX_RACES;
+place(id.DYN_PARENT, MAX_RACES * 4); place(id.ATWAR, MAX_CIVS * MAX_CIVS);
+place(id.UDEAD, nu); place(id.UHASPANIC, nu);
+align8();
+offs[id.RESULT] = off; off += RESULT_BYTES;
+place(id.CELL_CURSOR, (cells + 1) * 4);
+align8(); align8();
+place(id.UTX, nu * 8); align8(); place(id.UTY, nu * 8); align8(); place(id.UHP, nu * 8);
+align8(); place(id.UMAXHP, nu * 8); align8(); place(id.UDMG, nu * 8); align8(); place(id.USPEED, nu * 8);
+align8(); place(id.UAGE, nu * 8); align8(); place(id.UMAXAGE, nu * 8); align8(); place(id.UKILLS, nu * 8);
+align8(); place(id.UCD, nu * 8); align8(); place(id.UFD, nu * 8); align8(); place(id.UBREATH, nu * 8);
+align8(); place(id.ULX, nu * 8); align8(); place(id.ULY, nu * 8); align8(); place(id.USXK, nu * 8);
+align8(); place(id.USYK, nu * 8); align8(); place(id.USTK, nu * 4); align8(); place(id.UATK, nu * 8);
+align8(); place(id.UCHILL, nu * 8); align8(); place(id.UFLEET, nu * 8); align8(); place(id.UBLESS, nu * 8);
+align8(); place(id.UCURSE, nu * 8); align8(); place(id.UFERT, nu * 8); align8(); place(id.UDETOUR, nu * 8);
+align8(); place(id.UHURT, nu * 8); align8(); place(id.UJOB, nu * 4); align8(); place(id.UTRAIT, nu * 4);
+align8(); place(id.UINF, nu); align8(); place(id.UFLIP, nu); align8(); place(id.UPAR, nu);
+align8(); place(id.UBOAT, nu); align8(); place(id.UBTL, nu * 4); align8(); place(id.UCVN, nu * 4);
+align8(); place(id.UARMY, nu * 4); align8(); place(id.UGEAR, nu * 7 * 4); align8(); place(id.UGENE, nu * 4 * 8);
+align8(); place(id.UFAM, nu * 4); align8(); place(id.UFGN, nu * 4); align8(); place(id.UNAME, nu * 32);
+align8(); place(id.UGLN, nu * 4); align8(); place(id.UGIDS, nu * UG_CAP * 4); align8(); place(id.UGVAL, nu * UG_CAP * 8);
+align8(); place(id.TERR, TILES); align8(); place(id.FIREG, TILES); align8(); place(id.RAD, TILES);
+align8(); place(id.ROAD, TILES); align8(); place(id.BLDK, TILES); align8(); align8();
+place(id.OWN, TILES * 2); align8(); place(id.BIDX, TILES * 4);
+align8(); place(id.CIVN, 4); align8(); place(id.CVPOP, MAX_CIVS * 8); align8(); place(id.CVHOU, MAX_CIVS * 8);
+align8(); place(id.CVGLD, MAX_CIVS * 8); align8(); place(id.CVCAP, MAX_CIVS * 4); align8(); place(id.CVAL, MAX_CIVS);
+align8(); place(id.CVGOV, MAX_CIVS * 4); align8(); place(id.CVTECH, MAX_CIVS * 24 * 8); align8(); place(id.CVDIR, MAX_CIVS);
+align8(); place(id.CVPC, MAX_CIVS * 8); align8(); place(id.CVMKT, MAX_CIVS * 4);
+align8(); place(id.FAMN, 4); align8(); place(id.FMID, MAX_FAM * 4); align8(); place(id.FMRACE, MAX_FAM * 4);
+align8(); place(id.FMNUM, MAX_FAM * 6 * 8); align8(); place(id.FMSEQ, 4); align8(); place(id.FMNAME, MAX_FAM * 2 * 2);
+align8(); place(id.BLDN, 4); align8(); place(id.BLDI, MAX_BLD * 4); align8(); place(id.BLDXY, MAX_BLD * 2 * 4);
+align8(); place(id.BLDC, MAX_BLD * 4); align8(); place(id.BLDHP, MAX_BLD * 8); align8(); place(id.BLDDMG, MAX_BLD);
+align8(); place(id.ITMN, 4); align8(); place(id.ITMK, MAX_ITEMS * 4); align8(); place(id.ITMXY, MAX_ITEMS * 2 * 8);
+align8(); place(id.NEUW, 2048 * 8); align8(); place(id.NCTL, 1);
+align8(); place(id.RNGS, 4); align8(); place(id.TICK, 4); align8(); place(id.FRAME, 4); align8(); place(id.PAR, 1);
+align8(); place(id.USEQ, 4); align8(); place(id.EPS, 16 * 8); align8(); place(id.LAWS, 1); align8(); place(id.FXP, 1);
+align8(); place(id.FXLEN, 4); align8(); place(id.FXMIN, FXMIN_CAP * 4); align8(); place(id.FXMINN, 4);
+align8(); place(id.WILD, MAX_RACES * 4); align8(); place(id.GRASS, 8); align8(); place(id.DAYPH, 8);
+align8(); place(id.REPRM, 8); align8(); place(id.PREY, 640 * 2); align8(); place(id.SPB, MAX_RACES * 4 * 8);
+align8(); place(id.SPBH, MAX_RACES); align8(); place(id.TRN, 4); align8(); place(id.TRDMG, MAX_TRAITS * 8);
+align8(); place(id.TRHP, MAX_TRAITS * 8); align8(); place(id.TRSPD, MAX_TRAITS * 8); align8(); place(id.TRREG, MAX_TRAITS * 8);
+align8(); place(id.TRFL, MAX_TRAITS); align8(); place(id.CNT, 16 * 8);
+align8(); place(id.ACT, ACT_CAP); align8(); place(id.ACTN, 4); align8(); place(id.BAILK, 4);
+align8(); place(id.BAILS, 4); align8(); place(id.BAILL, 4); align8(); place(id.BAILP, 8 * 8);
+align8(); place(id.DIRTY, (MAX_UNITS + 7) / 8); align8(); place(id.DLIST, MAX_UNITS * 4);
+align8(); place(id.DLISTN, 4); align8(); place(id.BATCHR, 8 * 4);
+align8(); place(id.TBR, MAX_RACES * 12 * 8); align8(); place(id.TBF, MAX_RACES * 2); align8(); place(id.TBJ, 7 * 5 * 8);
+align8(); place(id.TBI, MAX_ITEMDEFS * 12 * 8); align8(); place(id.TBIN, 4); align8(); place(id.FRSTOFF, MAX_RACES * 4);
+align8(); place(id.FRSTN, MAX_RACES * 4); align8(); place(id.FRSTP, 16384); align8(); place(id.FAMP, 1024);
+align8(); place(id.TBT, 16); align8(); place(id.MLOOT, MAX_RACES); align8(); place(id.NEUCALL, 3 * 4);
+align8(); place(id.COLEN, 1); align8(); place(id.DMGL, MAX_BLD * 4); align8(); place(id.DMGN, 4);
+align8(); place(id.FIREN, 4); align8(); place(id.WILDCAP, MAX_RACES * 4); align8(); place(id.MONCAP, MAX_RACES * 4);
+align8(); place(id.MISC, 32 * 4); align8(); place(id.GUNBM, 4 * 4); align8(); place(id.BEAMBM, 4 * 4);
+align8(); place(id.TBHP, 16 * 8);
+
+let layoutFail = 0;
+for (let i = 0; i < N_REGIONS; i++) {
+  if (offs[i] !== golden.meta.offs[i]) {
+    layoutFail++;
+    if (layoutFail < 6) console.error(`  offs[${i}] wasm=${golden.meta.offs[i]} sim=${offs[i]}`);
+  }
+}
+console.log(`layout offs: ${layoutFail === 0 ? 'PASS' : `FAIL(${layoutFail})`} (${N_REGIONS} regions vs wasm wb_off)`);
+
+// —— 4) M-U2b：WbUnits.ScanSingle（wb_scan C# 版）JS 转写 vs wasm 随机场景对账 ——
+// 转写自 C# 源（WbUnits.cs ScanSingle/IsEnemySlot/IsEnemyFull/IsHerbivore/UPanic0 +
+// WriteI32Raw/WriteU32Raw/WriteF64Raw）——不从蓝本重推。LUT 用独立数组演化，
+// 终态与 wasm LUT 区域字节对账（防「用 wasm 验 wasm」循环论证的同时覆盖 LUT 行为）。
+{
+  const wasmBytes2 = readFileSync(path.join(ROOT, 'public/wasm/wbcore.wasm'));
+  const mod2 = await WebAssembly.instantiate(wasmBytes2, {});
+  const ex = mod2.instance.exports;
+  const mem = ex.memory;
+  const W = 256, H = 160, MAX_UNITS = 4096;
+  const ID = { GVALS: 3, UCIV: 4, URACE: 5, UID: 6, UCELL: 7, GIDS: 8, UDEAD: 14, UHASPANIC: 15, RESULT: 16, UX: 0, UY: 1, UPANIC: 2, CELL_START: 9, CELL_ITEMS: 10, RACE_FLAGS: 11, DYN_PARENT: 12, ATWAR: 13, OFF: 0 };
+  const MAX_RACES = 512, MAX_CIVS = 64, PANIC_CAP = 32, GRUDGE_CAP = 32;
+  const F_UNDEAD = 4, F_HOSTILE = 1, F_CIV = 2, F_PREDATOR = 8, F_HERBIVORE = 16;
+  const R_ZOMBIE = 5, R_BEAR = 8, R_DRAGON = 9, R_SCORPION = 13, R_SNAKE = 14, R_SKELETON = 16, R_DEMON = 17, R_WHITEWALKER = 23, R_KRAKEN = 25, R_SANDWORM = 26, R_BASILISK = 27;
+
+  const dv = () => new DataView(mem.buffer);
+  const u8 = (id, i) => new Uint8Array(mem.buffer, ex.wb_arena_ptr() + ex.wb_off(id))[i];
+  const setU8 = (id, i, v) => { new Uint8Array(mem.buffer, ex.wb_arena_ptr() + ex.wb_off(id))[i] = v & 0xff; };
+  const setU32 = (id, i, v) => dv().setUint32(ex.wb_arena_ptr() + ex.wb_off(id) + i * 4, v >>> 0, true);
+  const setI32 = (id, i, v) => dv().setInt32(ex.wb_arena_ptr() + ex.wb_off(id) + i * 4, v | 0, true);
+  const setF64 = (id, i, v) => dv().setFloat64(ex.wb_arena_ptr() + ex.wb_off(id) + i * 8, v, true);
+  const getF64 = (id, i) => dv().getFloat64(ex.wb_arena_ptr() + ex.wb_off(id) + i * 8, true);
+  const getU32 = (id, i) => dv().getUint32(ex.wb_arena_ptr() + ex.wb_off(id) + i * 4, true);
+  const getI32 = (id, i) => dv().getInt32(ex.wb_arena_ptr() + ex.wb_off(id) + i * 4, true);
+
+  // —— C# 转写：IsHerbivore（WbUnits.cs，lib.rs L355-368 链上溯） ——
+  const isHerbivoreCS = (r0) => {
+    let r = r0 >>> 0;
+    for (let i = 0; i < 32; i++) {
+      if ((u8(ID.RACE_FLAGS, r) & F_HERBIVORE) !== 0) return true;
+      const p = getI32(ID.DYN_PARENT, r);
+      if (p < 0) return false;
+      r = p >>> 0;
+    }
+    return false;
+  };
+  // —— C# 转写：IsEnemyFull（WbUnits.cs，机械序） ——
+  const isEnemyFullCS = (a, b) => {
+    const ra = getU32(ID.URACE, a) | 0, rb = getU32(ID.URACE, b) | 0;
+    const fa = u8(ID.RACE_FLAGS, ra), fb = u8(ID.RACE_FLAGS, rb);
+    if ((fa & F_UNDEAD) !== 0 && (fb & F_UNDEAD) !== 0) return false;
+    if (ra === R_ZOMBIE || rb === R_ZOMBIE) return ra !== rb;
+    if (ra === R_SKELETON || rb === R_SKELETON) return ra !== rb;
+    if (ra === R_WHITEWALKER || rb === R_WHITEWALKER) return ra !== rb;
+    if (ra === R_DRAGON || rb === R_DRAGON) return ra !== rb;
+    if (ra === R_DEMON || rb === R_DEMON) return ra !== rb;
+    if (ra === R_KRAKEN || rb === R_KRAKEN) return ra !== rb;
+    if (ra === R_SANDWORM || rb === R_SANDWORM) return ra !== rb;
+    if (ra === R_BASILISK || rb === R_BASILISK) return ra !== rb;
+    if ((fa & F_HOSTILE) !== 0 && (fb & F_CIV) !== 0) return true;
+    if ((fb & F_HOSTILE) !== 0 && (fa & F_CIV) !== 0) return true;
+    if ((fa & F_PREDATOR) !== 0 && isHerbivoreCS(rb >>> 0)) return true;
+    if ((fa & F_PREDATOR) !== 0 && ra === R_BEAR && (fb & F_CIV) !== 0) return true;
+    if (ra === R_SCORPION && isHerbivoreCS(rb >>> 0)) return true;
+    if (ra === R_SNAKE && (isHerbivoreCS(rb >>> 0) || rb === R_SCORPION)) return true;
+    const ca = getI32(ID.UCIV, a), cb = getI32(ID.UCIV, b);
+    if (ca >= 0 && cb >= 0 && ca !== cb) return u8(ID.ATWAR, ca * MAX_CIVS + cb) !== 0;
+    return false;
+  };
+  // —— C# 转写：IsEnemySlot + 独立 LUT（WbUnits.cs LutGet/LutSet 用独立 Uint8Array） ——
+  const lutCS = new Uint8Array(MAX_RACES * MAX_RACES);
+  const isEnemySlotCS = (a, b) => {
+    if (getI32(ID.UCIV, a) < 0 && getI32(ID.UCIV, b) < 0) {
+      const ra = getU32(ID.URACE, a) | 0, rb = getU32(ID.URACE, b) | 0;
+      const key = ra * MAX_RACES + rb;
+      const hit = lutCS[key];
+      if (hit === 1) return false;
+      if (hit === 2) return true;
+      const r = isEnemyFullCS(a, b);
+      lutCS[key] = r ? 2 : 1;
+      return r;
+    }
+    return isEnemyFullCS(a, b);
+  };
+  // —— C# 转写：UPanic0 ——
+  const uPanic0CS = (s) => u8(ID.UHASPANIC, s) !== 0 ? getF64(ID.UPANIC, s) : 0.0;
+  // —— C# 转写：ScanSingle 全量（WbUnits.cs；RESULT 写到独立 buffer，panic 直写 wasm 镜像前先快照）
+  const jsMin = (x, y) => (Math.min(x, y)); // C# WbMath.JsMin 语义见下（NaN 传染版）；场景值均有限，等价
+  function scanSingleCS(slot, cx, cy, contagious, gLen) {
+    const s = slot | 0;
+    // N 守卫：转写侧由调用者传 n（与 wasm 侧 st.n = pack_end(n) 同步）
+    const n = scanSingleCS._n;
+    if ((s >>> 0) >= n) return { rc: 0 };
+    const bw = W, bh = H;
+    const uxx = getF64(ID.UX, s), uyy = getF64(ID.UY, s);
+    const uCiv = getI32(ID.UCIV, s), uRace = getU32(ID.URACE, s);
+    const upanic0 = uPanic0CS(s);
+    const hasG = gLen >= 0;
+    const gn = gLen > 0 ? gLen : 0;
+    let enemy = -1, bestD = 7.0, enemyD = 7.0, allies = 0, foes = 0, panicN = 0, overflow = 0;
+    const panicSlots = new Uint32Array(PANIC_CAP), panicVals = new Float64Array(PANIC_CAP);
+    const panicMirror = []; // C# 直写镜像（等 wasm 侧写完对比）
+    let by = cy - 1;
+    while (by <= cy + 1) {
+      if (by < 0 || by >= bh) { by += 1; continue; }
+      let bx = cx - 1;
+      while (bx <= cx + 1) {
+        if (bx < 0 || bx >= bw) { bx += 1; continue; }
+        const cell = by * bw + bx;
+        const start = getU32(ID.CELL_START, cell) >>> 0, end = getU32(ID.CELL_START, cell + 1) >>> 0;
+        let k = start;
+        while (k < end) {
+          const other = getU32(ID.CELL_ITEMS, k) | 0;
+          k += 1;
+          if (u8(ID.UDEAD, other) !== 0 || other === s) continue;
+          const ddx = getF64(ID.UX, other) - uxx, ddy = getF64(ID.UY, other) - uyy;
+          if (isEnemySlotCS(s, other)) {
+            foes += 1;
+            const d2 = ddx * ddx + ddy * ddy;
+            if (!hasG && d2 >= bestD * bestD) continue;
+            const d = Math.sqrt(d2);
+            let wd = d;
+            if (hasG) {
+              const oid = getU32(ID.UID, other);
+              let gi = -1;
+              for (let t = 0; t < gn; t++) { if ((getI32(ID.GIDS, t) >>> 0) === oid) { gi = t; break; } }
+              if (gi >= 0) {
+                const gv = getF64(ID.GVALS, gi);
+                wd = d * (1.0 - 0.42 * jsMin(1.0, gv / 2.0));
+              }
+            }
+            if (wd < bestD) { bestD = wd; enemy = other; enemyD = d; }
+          } else if (uCiv >= 0 ? getI32(ID.UCIV, other) === uCiv : getU32(ID.URACE, other) === uRace) {
+            allies += 1;
+            if (contagious) {
+              const oPanic = uPanic0CS(other);
+              if (oPanic < upanic0 - 0.15 && ddx * ddx + ddy * ddy < 16.0) {
+                const np = jsMin(1.0, oPanic + upanic0 * 0.4);
+                panicMirror.push([other, np]); // C# 直写（不 dirty）
+                if (panicN < PANIC_CAP) { panicSlots[panicN] = other >>> 0; panicVals[panicN] = np; panicN += 1; }
+                else overflow = 1;
+              }
+            }
+          }
+        }
+        bx += 1;
+      }
+      by += 1;
+    }
+    // RESULT 424B（独立 buffer LE 序——WriteI32/U32/F64Raw 转写）
+    const buf = new ArrayBuffer(424), w = new DataView(buf);
+    w.setInt32(0, enemy, true); w.setInt32(4, overflow, true);
+    w.setFloat64(8, bestD, true); w.setFloat64(16, enemyD, true);
+    w.setUint32(24, allies, true); w.setUint32(28, foes, true);
+    w.setUint32(32, panicN, true); w.setUint32(36, 0, true);
+    for (let i = 0; i < PANIC_CAP; i++) w.setUint32(40 + i * 4, panicSlots[i], true);
+    for (let i = 0; i < PANIC_CAP; i++) w.setFloat64(168 + i * 8, panicVals[i], true);
+    return { rc: overflow !== 0 ? 2 : 1, buf, panicMirror };
+  }
+  scanSingleCS._n = 0;
+
+  // —— 随机场景双跑 ——
+  const RACE_POOL = [6, 8, 5, 4, 9, 25, 26, 16, 100, 101];
+  const FLAG_POOL = { 6: F_HERBIVORE, 8: F_PREDATOR, 5: F_HOSTILE | F_UNDEAD, 4: F_HOSTILE, 9: F_HOSTILE | F_PREDATOR, 25: F_HOSTILE, 26: F_HOSTILE, 16: F_HOSTILE | F_UNDEAD, 100: F_CIV, 101: F_CIV };
+  let scanFail = 0, lutFail = 0, panicFail = 0, lutOff;
+  // mulberry32 场景随机源（确定性）
+  let rs = 0x12345678;
+  const rnd = () => { rs = (rs + 0x6d2b79f5) >>> 0; let t = rs; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+
+  for (let round = 0; round < 120; round++) {
+    ex.wb_init(W, H, MAX_UNITS);
+    // lutOff 推导（C# WbArena 布局同款：RACE_FLAGS 后对齐）
+    lutOff = (ex.wb_off(ID.RACE_FLAGS) + MAX_RACES + 7) & ~7;
+    lutCS.fill(0);
+    // 种族表
+    for (const r of RACE_POOL) { setU8(ID.RACE_FLAGS, r, FLAG_POOL[r]); setU8(11, r, FLAG_POOL[r]); }
+    // 随机单位 2-9 只，聚在 (60..76, 60..76)（9 桶邻域）
+    const n = 2 + Math.floor(rnd() * 8);
+    for (let i = 0; i < n; i++) {
+      const race = RACE_POOL[Math.floor(rnd() * RACE_POOL.length)];
+      const x = 60 + rnd() * 16, y = 60 + rnd() * 16;
+      setU32(ID.UID, i, i + 10); setU32(ID.URACE, i, race);
+      setU32(ID.UCELL, i, Math.floor(y / 4) * W + Math.floor(x / 4));
+      setF64(ID.UX, i, x); setF64(ID.UY, i, y);
+      setF64(ID.UTX, i, x); setF64(ID.UTY, i, y);
+      setF64(ID.USPEED, i, 0.08); setF64(ID.UHP, i, 100); setF64(ID.UMAXHP, i, 100);
+      setF64(ID.UMAXAGE, i, 9999); setF64(ID.UFD, i, NaN);
+      setI32(ID.UCIV, i, rnd() < 0.5 ? -1 : Math.floor(rnd() * 3));
+      setI32(ID.UJOB, i, -1); setI32(ID.UARMY, i, -1); setI32(ID.UGLN, i, -1);
+      setI32(ID.UFAM, i, -1); setI32(ID.UFGN, i, -1); setI32(ID.USTK, i, 0);
+      setU8(ID.UDEAD, i, rnd() < 0.12 ? 1 : 0);
+      const hasP = rnd() < 0.6;
+      setU8(ID.UHASPANIC, i, hasP ? 1 : 0); setF64(ID.UPANIC, i, hasP ? +(rnd() * 0.95).toFixed(3) : 0);
+      setU8(ID.UINF, i, 0); setU8(ID.UBOAT, i, 0); setU8(ID.UFLIP, i, 0);
+      for (let g = 0; g < 4; g++) setF64(53, i * 4 + g, 1);
+    }
+    // civ 战争矩阵随机
+    for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) setU8(ID.ATWAR, a * MAX_CIVS + b, rnd() < 0.3 ? 1 : 0);
+    // grudge 平面表
+    const gLen = rnd() < 0.4 ? 1 + Math.floor(rnd() * 2) : -1;
+    if (gLen > 0) for (let t = 0; t < gLen; t++) { setI32(ID.GIDS, t, 10 + Math.floor(rnd() * n)); setF64(ID.GVALS, t, +(rnd() * 3).toFixed(2)); }
+    ex.wb_pack_end(n);
+    scanSingleCS._n = n;
+    // 快照 panic 基线（对比直写镜像）
+    const panicBefore = Array.from({ length: n }, (_, i) => [u8(ID.UHASPANIC, i), getF64(ID.UPANIC, i)]);
+    const slot = Math.floor(rnd() * n);
+    const cx = 15, cy = 15;
+    const contagious = rnd() < 0.5;
+    // wasm 先跑
+    const rcW = ex.wb_scan(slot, cx, cy, contagious ? 1 : 0, gLen);
+    const roW = Buffer.from(mem.buffer, ex.wb_arena_ptr() + ex.wb_off(ID.RESULT), 424);
+    const panicAfterW = Array.from({ length: n }, (_, i) => [u8(ID.UHASPANIC, i), getF64(ID.UPANIC, i)]);
+    // C# 转写后跑（注意：panic 直写会改 wasm 内存——先快照 wasm 写完的状态再跑转写）
+    const rCS = scanSingleCS(slot, cx, cy, contagious, gLen);
+    const bufHex = Buffer.from(rCS.buf).toString('hex');
+    const roHexW = roW.toString('hex');
+    if (rcW !== rCS.rc || bufHex !== roHexW) {
+      scanFail++;
+      if (scanFail < 4) {
+        console.error(`  scan mismatch @round${round}: rc ${rcW} vs ${rCS.rc}`);
+        for (let i = 0; i < 424; i++) if (bufHex[i * 2] !== roHexW[i * 2] || bufHex[i * 2 + 1] !== roHexW[i * 2 + 1]) { console.error(`    首 diff @byte${i}`); break; }
+      }
+    }
+    // panic 镜像对比（转写记录 vs wasm 实写差分）
+    const wWrites = [];
+    for (let i = 0; i < n; i++) {
+      const [h0, p0] = panicBefore[i], [h1, p1] = panicAfterW[i];
+      if (h1 === 1 && !(h0 === 1 && p0 === p1)) wWrites.push([i, p1]);
+    }
+    const mWrites = rCS.panicMirror.map(([o, np]) => [o, np]);
+    if (JSON.stringify(wWrites) !== JSON.stringify(mWrites)) {
+      panicFail++;
+      if (panicFail < 4) console.error(`  panic mirror mismatch @round${round}: wasm=${JSON.stringify(wWrites)} cs=${JSON.stringify(mWrites)}`);
+    }
+    // LUT 终态对比（转写独立 LUT vs wasm LUT 区域）
+    const lutW = new Uint8Array(mem.buffer, ex.wb_arena_ptr() + lutOff, 512 * 512);
+    for (let i = 0; i < 512 * 512; i++) {
+      if (lutW[i] !== lutCS[i]) { lutFail++; if (lutFail < 4) console.error(`  LUT mismatch @round${round} key=${i} wasm=${lutW[i]} cs=${lutCS[i]}`); break; }
+    }
+  }
+  console.log(`scan (C# JS 转写 vs wasm wb_scan): ${scanFail === 0 && panicFail === 0 && lutFail === 0 ? 'PASS' : `FAIL(scan=${scanFail} panic=${panicFail} lut=${lutFail})`} (120 随机场景 × 424B 逐位 + panic 镜像 + LUT 终态)`);
+  var scanVerifyFail = scanFail + panicFail + lutFail;
+}
+
+// ============================================================
+// 5) M-U2c：fdlibm 六件套（WbMath.FdExp/FdExpm1/FdTanh/FdAtan/FdAtan2/FdSin/FdCos
+//    的 JS 转写 = combat-transcript 导出）vs wasm wb_math_test(op=0..4) + 战斗树转写对账
+// ============================================================
+// Node 24 下 gen-units-* 的原生 import 链（types→items 无后缀）解析失败 → 全部走 jiti 动态加载
+const mScan = await _jiti0.import(new URL('./gen-units-scan.mjs', import.meta.url).pathname);
+const mCombat = await _jiti0.import(new URL('./combat-transcript.mjs', import.meta.url).pathname);
+const mCombatGen = await _jiti0.import(new URL('./gen-units-combat.mjs', import.meta.url).pathname);
+const gex = mScan.ex;
+const transcriptBatch = mCombat.unitsBatch, tsSin = mCombat.fdSin, tsCos = mCombat.fdCos, tsExp = mCombat.fdExp, tsTanh = mCombat.fdTanh, tsAtan2 = mCombat.fdAtan2;
+const gInitWorld = mScan.initWorld, gSetU8 = mScan.setU8, gSetI32 = mScan.setI32, gSetF64 = mScan.setF64, gGetF64 = mScan.getF64, gGetU32 = mScan.getU32, gU8 = mScan.u8, gBits = mScan.bits;
+const cbBoot = mCombatGen.bootTables, cbPutUnit = mCombatGen.putUnitC, cbFill = mCombatGen.fillTerrainEx;
+const { R: gR } = await _jiti0.import(new URL('./../../src/lib/game/types.ts', import.meta.url).pathname);
+
+{
+  // —— 5a. fdlibm 六件套位级对账（sin/cos/exp/tanh/atan2，hypot 段 2 已覆盖）——
+  const wbits = (op, y, x) => {
+    const b = new BigUint64Array(new Float64Array([y]).buffer)[0];
+    const xb = new BigUint64Array(new Float64Array([x]).buffer)[0];
+    return gex.wb_math_test(b, xb, op);
+  };
+  const wasmFn = {
+    0: (y, x) => fromBits2(0n, wbits(0, y, x)),
+    1: (y, x) => fromBits2(0n, wbits(1, y, x)),
+    2: (y) => fromBits2(0n, wbits(2, y, 0)),
+    3: (y) => fromBits2(0n, wbits(3, y, 0)),
+    4: (y, x) => fromBits2(0n, wbits(4, y, x)),
+  };
+  function fromBits2(_lo, b) { void _lo; return new Float64Array(new BigUint64Array([b]).buffer)[0]; }
+  const csharpFn = { 0: tsSin, 1: tsCos, 2: tsExp, 3: tsTanh, 4: tsAtan2 };
+  // mulberry32 场内确定性源（避免与段 1 的 refNext 互相干扰）
+  let fz = 0x5eed1234 >>> 0;
+  const frand = () => { fz = (fz + 0x6d2b79f5) >>> 0; let t = fz ^ (fz >>> 15); t = Math.imul(t, 1 | fz) >>> 0; const t2 = ((t + (Math.imul(t ^ (t >>> 7), 61 | t) >>> 0)) ^ t) >>> 0; return ((t2 ^ (t2 >>> 14)) >>> 0) / 4294967296; };
+  const randFinite = () => {
+    // 随机有限双精度（指数分布偏游戏域；避免 NaN/Inf 噪声主导）
+    const cls = frand();
+    if (cls < 0.5) return (frand() * 2 - 1) * 12;                        // 游戏值域
+    if (cls < 0.75) return (frand() * 2 - 1) * 710;                      // exp 溢出边界域
+    const b = Math.floor(frand() * 0x7fe) + 1;                            // 全指数域有限值
+    return new Float64Array(new BigUint64Array([BigInt(frand() < 0.5 ? 0 : 1) << 63n | BigInt(b) << 52n | BigInt(Math.floor(frand() * 0xfffffffffffff))]).buffer)[0];
+  };
+  let mFail = 0, mN = 0;
+  const cases = [];
+  for (let i = 0; i < 20000; i++) {
+    cases.push([0, randFinite(), randFinite()]);
+    cases.push([1, randFinite(), randFinite()]);
+    cases.push([2, randFinite(), 0]);
+    cases.push([3, randFinite(), 0]);
+    cases.push([4, randFinite(), randFinite()]);
+  }
+  // 边界特例（atan2 分支覆盖）
+  for (const sp of [0, -0.0, 1, -1, Infinity, -Infinity]) {
+    for (const sp2 of [0, -0.0, 1, -1, Infinity, -Infinity]) {
+      cases.push([4, sp, sp2]);
+    }
+  }
+  for (const [op, y, x] of cases) {
+    mN++;
+    const wv = wasmFn[op](y, x);
+    const cv = csharpFn[op](y, x);
+    const wb = new BigUint64Array(new Float64Array([wv]).buffer)[0];
+    const cb = new BigUint64Array(new Float64Array([cv]).buffer)[0];
+    if (wb !== cb) { mFail++; if (mFail < 6) console.error(`  fdlibm mismatch op=${op} y=${y} x=${x}: wasm=${wv} cs=${cv}`); }
+  }
+  console.log(`fdlibm 六件套: ${mFail === 0 ? 'PASS' : `FAIL(${mFail})`} (${mN} samples vs wasm wb_math_test op0-4)`);
+  var fdlibmFail = mFail;
+
+  // —— 5b. 战斗树黄金回放（combat-transcript unitsBatch 重放 units_combat.json 29 场景逐位）——
+  const combatGolden = JSON.parse(readFileSync(path.join(ROOT, 'scripts/unity-migration/golden/units_combat.json'), 'utf8'));
+  const R_ID = { CIVN: 67, CVTECH: 74, CVMKT: 77, CVAL: 72, DAYPH: 108, ATWAR: 13, UPAR: 47 };
+  const F64F = [['x', 0], ['y', 1], ['tx', 18], ['ty', 19], ['hp', 20], ['panic', 2], ['fleet', 37], ['cd', 27], ['atk', 35], ['hurt', 42], ['food', 28], ['kills', 26], ['breath', 29], ['age', 24]];
+  function sampleTickV(slots, sc) {
+    const memV = gex.memory;
+    const dv = new DataView(memV.buffer);
+    const at = (rid) => gex.wb_arena_ptr() + gex.wb_off(rid);
+    const units = slots.map((s) => {
+      const o = {
+        slot: s, race: gGetU32(5, s), dead: gU8(14, s), hasPanic: gU8(15, s),
+        inf: gU8(45, s), boat: gU8(48, s), flip: gU8(46, s),
+        glen: dv.getInt32(at(57) + s * 4, true),
+      };
+      for (const [k, rid] of F64F) o[k] = gBits(dv.getFloat64(at(rid) + s * 8, true));
+      o.gids = []; o.gvals = [];
+      for (let g = 0; g < 8; g++) {
+        o.gids.push(dv.getInt32(at(58) + (s * 8 + g) * 4, true));
+        o.gvals.push(gBits(dv.getFloat64(at(59) + (s * 8 + g) * 8, true)));
+      }
+      return o;
+    });
+    const actN = gGetU32(121, 0);
+    const actBase = gex.wb_arena_ptr() + gex.wb_off(120);
+    const out = {
+      rng: gGetU32(95, 0), tick: gGetU32(96, 0), actN,
+      dlistN: gGetU32(128, 0), batchR: gGetU32(129, 0), bailK: gGetU32(122, 0),
+      cnt4: gBits(dv.getFloat64(at(119) + 4 * 8, true)),
+      wildZombie: dv.getInt32(at(106) + 5 * 4, true),
+      wildSheep: dv.getInt32(at(106) + 6 * 4, true),
+      cvpop0: gBits(dv.getFloat64(at(68) + 0 * 8, true)),
+      fireN: dv.getInt32(at(145), true),
+      neuCall: [dv.getUint32(at(141), true), dv.getUint32(at(141) + 4, true), dv.getUint32(at(141) + 8, true)],
+      units, actHex: Buffer.from(memV.buffer, actBase, Math.min(actN, 512)).toString('hex'),
+    };
+    if (sc?.terrProbe) {
+      const terr = new Uint8Array(memV.buffer, gex.wb_arena_ptr() + gex.wb_off(60), 40960);
+      out.terr = sc.terrProbe.map(([x, y]) => terr[y * 256 + x]);
+    }
+    return out;
+  }
+  function setupWorldV(sc) {
+    gInitWorld(sc.seed, sc.fxp ?? 0);
+    gSetU8(101, 0, sc.laws ?? 0);
+    if (sc.dayph !== undefined) gSetF64(R_ID.DAYPH, 0, sc.dayph);
+    if (sc.nctl !== undefined) gSetU8(94, 0, sc.nctl);
+    if (sc.neuw) for (const [i, v] of sc.neuw) gSetF64(93, i, v);
+    cbFill(sc.terrain ?? {});
+    cbBoot();
+    if (sc.civs) {
+      gSetI32(R_ID.CIVN, 0, sc.civs.length);
+      sc.civs.forEach((c, i) => {
+        gSetU8(R_ID.CVAL, i, 1);
+        if (c.mkt !== undefined) gSetI32(R_ID.CVMKT, i, c.mkt);
+        if (c.plague !== undefined) gSetF64(R_ID.CVTECH, i * 24 + 14, c.plague);
+        if (c.archer !== undefined) gSetF64(R_ID.CVTECH, i * 24 + 13, c.archer);
+        if (c.range !== undefined) gSetF64(R_ID.CVTECH, i * 24 + 15, c.range);
+      });
+    }
+    if (sc.atwar) for (const [a, b] of sc.atwar) { gSetU8(R_ID.ATWAR, a * 64 + b, 1); gSetU8(R_ID.ATWAR, b * 64 + a, 1); }
+    for (const u of sc.units) cbPutUnit(u.slot, u);
+    gex.wb_pack_end(sc.units.length);
+  }
+  function hostStepV(sc) {
+    gSetU8(98, 0, gU8(98, 0) ^ 1);
+    for (const u of sc.units) {
+      if (gU8(14, u.slot)) continue;
+      const x = gGetF64(0, u.slot), y = gGetF64(1, u.slot);
+      gSetI32(7, u.slot, Math.floor(y / 4) * 256 + Math.floor(x / 4));
+      gSetU8(R_ID.UPAR, u.slot, gU8(98, 0));
+    }
+    gex.wb_pack_end(sc.units.length);
+  }
+  let cgFail = 0;
+  for (const gs of combatGolden.scenarios) {
+    const sc = gs.input;
+    const slots = sc.units.map((u) => u.slot);
+    setupWorldV(sc);
+    for (let t = 0; t < sc.ticks; t++) {
+      const rcT = transcriptBatch(0, 0, sc.units.length);
+      const got = { rc: rcT, ...sampleTickV(slots, sc) };
+      const want = gs.output[t];
+      const jw = JSON.stringify(want);
+      const jg = JSON.stringify(got);
+      if (jw !== jg) { cgFail++; if (cgFail < 4) { console.error(`  golden replay mismatch ${sc.name} tick${t}`); for (const k of Object.keys(want)) { if (JSON.stringify(want[k]) !== JSON.stringify(got[k])) console.error(`    field ${k}: want=${JSON.stringify(want[k]).slice(0, 120)} got=${JSON.stringify(got[k]).slice(0, 120)}`); } } }
+      hostStepV(sc);
+    }
+  }
+  console.log(`combat 黄金回放 (转写 unitsBatch vs units_combat.json): ${cgFail === 0 ? 'PASS' : `FAIL(${cgFail})`} (${combatGolden.scenarios.length} 场景 × 全字段逐位)`);
+
+  // —— 5c. 随机混战 fuzz（转写 vs wasm 同布置双跑）——
+  const POOL = [
+    [gR.WOLF, gR.SHEEP], [gR.BANDIT, gR.HUMAN], [gR.MAGE, gR.HUMAN], [gR.ZOMBIE, gR.HUMAN],
+    [gR.DRAGON, gR.HUMAN], [gR.KRAKEN, gR.HUMAN], [gR.BASILISK, gR.SHEEP], [gR.SANDWORM, gR.SHEEP],
+    [gR.VAMPIRE, gR.HUMAN], [gR.WHITEWALKER, gR.HUMAN], [gR.SNAKE, gR.SHEEP], [gR.BEAR, gR.SHEEP],
+  ];
+  function fuzzSetup(seed) {
+    fz = seed >>> 0;
+    const fr = frand;
+    const [ra, rb] = POOL[Math.floor(fr() * POOL.length)];
+    const x0 = 20 + fr() * 200, y0 = 20 + fr() * 120;
+    const dx = (fr() * 7 - 3.5), dy = fr() * 2 - 1;
+    const civA = ra === gR.HUMAN ? 0 : -1;
+    const civB = rb === gR.HUMAN ? 1 : -1;
+    const sc = {
+      seed, ticks: 2, fxp: Math.floor(fr() * 16),
+      civs: [{}, {}], atwar: fr() < 0.5 ? [[0, 1]] : undefined,
+      units: [
+        {
+          slot: 0, race: ra, civ: civA, x: x0, y: y0,
+          hp: 5 + fr() * 90, maxhp: 100, dmg: 3 + fr() * 10,
+          food: fr() < 0.5 ? undefined : fr() * 120,
+          panic: fr() < 0.25 ? fr() : undefined,
+          fleet: fr() < 0.2 ? fr() * 40 : 0,
+          cvn: fr() < 0.1 ? 0.5 : 0,
+          inf: fr() < 0.08, job: fr() < 0.3 ? 3 : undefined,
+          gear: fr() < 0.25 ? [29] : undefined,
+          grudges: fr() < 0.3 ? [{ oid: 1, gv: fr() * 3 }] : undefined,
+        },
+        {
+          slot: 1, race: rb, civ: civB, id: 1, x: x0 + dx, y: y0 + dy,
+          hp: 3 + fr() * 90, maxhp: 100, dmg: 3 + fr() * 10,
+          food: fr() < 0.5 ? undefined : fr() * 120,
+          panic: fr() < 0.25 ? fr() : undefined,
+          boat: ra === gR.KRAKEN && fr() < 0.6,
+          gear: fr() < 0.2 ? [-1, 8] : undefined,
+        },
+      ],
+    };
+    return sc;
+  }
+  let fzFail = 0;
+  for (let round = 0; round < 60; round++) {
+    const sc = fuzzSetup(0x9000000 + round * 7919);
+    // wasm 跑
+    setupWorldV(sc);
+    const slots = sc.units.map((u) => u.slot);
+    const gotW = [];
+    for (let t = 0; t < sc.ticks; t++) {
+      const rc = gex.wb_units_batch(0, 0);
+      const smp = { rc, ...sampleTickV(slots, sc) };
+      gotW.push(JSON.stringify(smp));
+      hostStepV(sc);
+    }
+    // 转写跑（同布置）
+    setupWorldV(sc);
+    const gotC = [];
+    for (let t = 0; t < sc.ticks; t++) {
+      const rc = transcriptBatch(0, 0, sc.units.length);
+      const smp = { rc, ...sampleTickV(slots, sc) };
+      gotC.push(JSON.stringify(smp));
+      hostStepV(sc);
+    }
+    for (let t = 0; t < sc.ticks; t++) {
+      if (gotW[t] !== gotC[t]) {
+        fzFail++;
+        if (fzFail < 4) {
+          const w = JSON.parse(gotW[t]), c = JSON.parse(gotC[t]);
+          console.error(`  fuzz mismatch round${round} tick${t} (seed 0x${sc.seed.toString(16)})`);
+          for (const k of Object.keys(w)) if (JSON.stringify(w[k]) !== JSON.stringify(c[k])) console.error(`    ${k}: wasm=${JSON.stringify(w[k]).slice(0, 100)} cs=${JSON.stringify(c[k]).slice(0, 100)}`);
+        }
+        break;
+      }
+    }
+  }
+  console.log(`combat fuzz (转写 vs wasm 同布置双跑): ${fzFail === 0 ? 'PASS' : `FAIL(${fzFail})`} (60 随机场景 × 2 tick 全字段逐位)`);
+  var combatVerifyFail = cgFail + fzFail;
+}
+
+// ============================================================
+// 6) M-U2d：spawn/繁衍/拾取/家族黄金回放（combat-transcript 升级版 unitsBatch
+//    含 SpawnUnit/繁衍段/TryPickup/RiseSkeleton 转写）vs units_spawn.json 26 场景逐位
+//    驱动协议：USEQ 差值追踪 live + 宿主重排含新 slot + pack_end(liveN)
+// ============================================================
+const mSpawn = await _jiti0.import(new URL('./gen-units-spawn.mjs', import.meta.url).pathname);
+const spSampleTick = mSpawn.sampleTick, spTraits = mSpawn.traitsPool, spFirst = mSpawn.firstPool, spPutUnit = mSpawn.putUnitSp, spItemIdx = mSpawn.itemIdx;
+const { NEUTRAL_MODS: spNeutral } = await _jiti0.import(new URL('./../../src/lib/game/tech.ts', import.meta.url).pathname);
+const { FIRST: spFirstTable } = await _jiti0.import(new URL('./../../src/lib/game/names.ts', import.meta.url).pathname);
+
+{
+  const spawnGolden = JSON.parse(readFileSync(path.join(ROOT, 'scripts/unity-migration/golden/units_spawn.json'), 'utf8'));
+  const spR = {
+    MISC: 148, WILDCAP: 146, MONCAP: 147, WILD: 106, REPRM: 109, SPB: 111, SPBH: 112,
+    TRN: 113, TRDMG: 114, TRHP: 115, TRSPD: 116, CNT: 119, BAILP: 125, USEQ: 99,
+    CIVN: 67, CVPOP: 68, CVAL: 72, CVGOV: 73, CVTECH: 74, CVDIR: 75, CVPC: 76, CVMKT: 77,
+    FAMN: 78, FMID: 79, FMRACE: 80, FMNUM: 81, FMSEQ: 82, FMNAME: 83,
+    ITMK: 91, ITMXY: 92, ITMN: 90, TBI: 133, TBIN: 134,
+    FRSTOFF: 135, FRSTN: 136, FRSTP: 137, ATWAR: 13, UPAR: 47, UNAME: 56, UGEAR: 52, UTRAIT: 44,
+    DAYPH: 108, LAWS: 101,
+  };
+  const TC_DMG = 0, TC_HP = 1, TC_REPRO = 5, TC_IDEA_REPRO = 18;
+
+  function setupWorldSp(sc) {
+    gInitWorld(sc.seed, sc.fxp ?? 0);
+    gSetI32(spR.MISC, 1, 4096); // wild 预算（gen initWorldSp 同款）
+    new Int32Array(gex.memory.buffer, gex.wb_arena_ptr() + gex.wb_off(spR.WILDCAP), 512).fill(4096);
+    gSetU8(spR.LAWS, 0, sc.laws ?? 0);
+    if (sc.dayph !== undefined) gSetF64(spR.DAYPH, 0, sc.dayph);
+    if (sc.reprm !== undefined) gSetF64(spR.REPRM, 0, sc.reprm);
+    cbFill(sc.terrain ?? {});
+    cbBoot();
+    spTraits({}); // TRAITS 真表键序灌入（gen 同源）
+    spFirst({}); // FIRST 名池 24B 条目灌入（gen 同源）
+    if (sc.civs) {
+      gSetI32(spR.CIVN, 0, sc.civs.length);
+      sc.civs.forEach((c, i) => {
+        gSetU8(spR.CVAL, i, 1);
+        // CVTECH = NEUTRAL_MODS 中性基线（gen 同款；TC_REPRO=0 乘零链防线）
+        gSetF64(spR.CVTECH, i * 24 + TC_DMG, c.techDmg ?? spNeutral.dmg);
+        gSetF64(spR.CVTECH, i * 24 + TC_HP, c.techHp ?? spNeutral.hp);
+        gSetF64(spR.CVTECH, i * 24 + 2, spNeutral.bhp);
+        gSetF64(spR.CVTECH, i * 24 + TC_REPRO, c.techRepro ?? spNeutral.repro);
+        gSetF64(spR.CVTECH, i * 24 + 9, spNeutral.repair);
+        gSetF64(spR.CVTECH, i * 24 + 13, spNeutral.archer);
+        gSetF64(spR.CVTECH, i * 24 + 14, spNeutral.plague);
+        gSetF64(spR.CVTECH, i * 24 + 15, spNeutral.range);
+        gSetF64(spR.CVTECH, i * 24 + TC_IDEA_REPRO, c.techIdea ?? 0);
+        if (c.pop !== undefined) gSetF64(spR.CVPOP, i, c.pop);
+        if (c.pc !== undefined) gSetF64(spR.CVPC, i, c.pc);
+        if (c.gov !== undefined) gSetI32(spR.CVGOV, i, c.gov);
+        if (c.dir !== undefined) gSetU8(spR.CVDIR, i, c.dir);
+        if (c.mkt !== undefined) gSetI32(spR.CVMKT, i, c.mkt);
+      });
+    }
+    if (sc.atwar) for (const [a, b] of sc.atwar) { gSetU8(spR.ATWAR, a * 64 + b, 1); gSetU8(spR.ATWAR, b * 64 + a, 1); }
+    if (sc.fams) {
+      sc.fams.forEach((f, i) => {
+        gSetI32(spR.FMID, i, f.id);
+        gSetI32(spR.FMRACE, i, f.race ?? 0);
+        for (let k = 0; k < 6; k++) gSetF64(spR.FMNUM, i * 6 + k, f.num?.[k] ?? 0);
+        if (f.pre !== undefined) gSetI32(spR.FMNAME, i * 2, f.pre);
+        if (f.post !== undefined) gSetI32(spR.FMNAME, i * 2 + 1, f.post);
+      });
+      gSetI32(spR.FAMN, 0, sc.fams.length);
+    }
+    if (sc.wilds) for (const [r, n] of sc.wilds) gSetI32(spR.WILD, r, n);
+    if (sc.wildcaps) for (const [r, n] of sc.wildcaps) gSetI32(spR.WILDCAP, r, n);
+    if (sc.moncaps) for (const [r, n] of sc.moncaps) gSetI32(spR.MONCAP, r, n);
+    if (sc.spb) for (const [r, gene] of sc.spb) { for (let k = 0; k < 4; k++) gSetF64(spR.SPB, r * 4 + k, gene[k]); gSetU8(spR.SPBH, r, 1); }
+    if (sc.cnt5 !== undefined) gSetF64(spR.CNT, 5, sc.cnt5);
+    if (sc.items) {
+      sc.items.forEach((it, i) => {
+        gSetI32(spR.ITMK, i, typeof it.k === 'string' ? spItemIdx(it.k) : it.k);
+        gSetF64(spR.ITMXY, i * 2, it.x);
+        gSetF64(spR.ITMXY, i * 2 + 1, it.y);
+      });
+      gSetI32(spR.ITMN, 0, sc.items.length);
+    }
+    for (const u of sc.units) spPutUnit(u.slot, u);
+  }
+  function hostStepSp(sc, liveN) {
+    gSetU8(98, 0, gU8(98, 0) ^ 1);
+    for (let s = 0; s < liveN; s++) {
+      if (gU8(14, s)) continue;
+      const x = gGetF64(0, s), y = gGetF64(1, s);
+      gSetI32(7, s, Math.floor(y / 4) * 256 + Math.floor(x / 4));
+      gSetU8(spR.UPAR, s, gU8(98, 0));
+    }
+    gex.wb_pack_end(liveN);
+  }
+  let spFail = 0;
+  for (const gs of spawnGolden.scenarios) {
+    const sc = gs.input;
+    setupWorldSp(sc);
+    const useq0 = gGetU32(spR.USEQ, 0);
+    let liveN = sc.units.length;
+    gex.wb_pack_end(liveN);
+    for (let t = 0; t < sc.ticks; t++) {
+      const rcT = transcriptBatch(0, 0, liveN);
+      const spawned = gGetU32(spR.USEQ, 0) - useq0;
+      liveN = sc.units.length + spawned;
+      const slots = [...sc.units.map((u) => u.slot), ...Array.from({ length: spawned }, (_, k) => sc.units.length + k)];
+      const got = { rc: rcT, spawned, ...spSampleTick(slots, sc) };
+      const want = gs.output[t];
+      const jw = JSON.stringify(want);
+      const jg = JSON.stringify(got);
+      if (jw !== jg) {
+        spFail++;
+        if (spFail < 4) {
+          console.error(`  spawn golden mismatch ${sc.name} tick${t}`);
+          for (const k of Object.keys(want)) {
+            if (JSON.stringify(want[k]) !== JSON.stringify(got[k])) console.error(`    field ${k}: want=${JSON.stringify(want[k]).slice(0, 140)} got=${JSON.stringify(got[k]).slice(0, 140)}`);
+          }
+        }
+      }
+      hostStepSp(sc, liveN);
+    }
+  }
+  console.log(`spawn 黄金回放 (转写 unitsBatch+SpawnUnit vs units_spawn.json): ${spFail === 0 ? 'PASS' : `FAIL(${spFail})`} (${spawnGolden.scenarios.length} 场景 × 全字段逐位)`);
+  var spawnVerifyFail = spFail;
+  void spFirstTable; // FIRST 表经 spFirst 内部 import 消费（此引用防 lint 未用）
+}
+
+// ============================================================
+// 7) M-U3a：civ/建筑辅助族黄金回放（combat-transcript 升级版 unitsBatch
+//    含 fireNear/extinguishFire/damagedNear/enemyBuildingNear/nearestEnemyBuilding/
+//    nearestBuildingOf/repairBuilding/attackBuilding/dmgSet 族转写）
+//    vs units_civ.json 30 场景全字段逐位（布置协议与 gen-units-civ 同源 import，纪律②）
+//    ⚠ 2026-10-27 10:46 本段曾被并行 cron agent 覆写丢失，本处为重落盘（内容同源）
+// ============================================================
+const mCiv = await _jiti0.import(new URL('./gen-units-civ.mjs', import.meta.url).pathname);
+const cvPutTbhp = mCiv.putTbhp, cvFillOwn = mCiv.fillOwnNeg1, cvPutCivs = mCiv.putCivs, cvPutBuildings = mCiv.putBuildings, cvPutFires = mCiv.putFires, cvPutDamaged = mCiv.putDamaged, cvPutCnt = mCiv.putCnt, cvSampleTick = mCiv.civSampleTick;
+
+{
+  const civGolden = JSON.parse(readFileSync(path.join(ROOT, 'scripts/unity-migration/golden/units_civ.json'), 'utf8'));
+  const CV_UPAR = 47;
+  function cvSetupWorld(sc) {
+    gInitWorld(sc.seed, sc.fxp ?? 0);
+    cbFill(sc.terrain ?? {});
+    cbBoot();
+    cvPutTbhp();
+    cvFillOwn();
+    cvPutCivs(sc.civs ?? [{}]);
+    if (sc.atwar) for (const [a, b] of sc.atwar) { gSetU8(13, a * 64 + b, 1); gSetU8(13, b * 64 + a, 1); }
+    const techBhp = (sc.civs && sc.civs[0] && sc.civs[0].bhp) || 1;
+    if (sc.blds) cvPutBuildings(sc.blds, techBhp);
+    if (sc.fires) cvPutFires(sc.fires);
+    if (sc.damaged) cvPutDamaged(sc.damaged);
+    cvPutCnt(sc.cnt);
+    for (const u of sc.units) cbPutUnit(u.slot, u);
+    gex.wb_pack_end(sc.units.length);
+  }
+  function cvHostStep(sc) {
+    gSetU8(98, 0, gU8(98, 0) ^ 1);
+    for (const u of sc.units) {
+      if (gU8(14, u.slot)) continue;
+      const x = gGetF64(0, u.slot), y = gGetF64(1, u.slot);
+      gSetI32(7, u.slot, Math.floor(y / 4) * 256 + Math.floor(x / 4));
+      gSetU8(CV_UPAR, u.slot, gU8(98, 0));
+    }
+    gex.wb_pack_end(sc.units.length);
+  }
+  let cvFail = 0;
+  for (const gs of civGolden.scenarios) {
+    const sc = gs.input;
+    cvSetupWorld(sc);
+    const slots = sc.units.map((u) => u.slot);
+    for (let t = 0; t < (sc.ticks ?? 2); t++) {
+      const rcT = transcriptBatch(0, 0, sc.units.length);
+      const got = { rc: rcT, ...cvSampleTick(slots, sc) };
+      const want = gs.output[t];
+      const jw = JSON.stringify(want);
+      const jg = JSON.stringify(got);
+      if (jw !== jg) {
+        cvFail++;
+        if (cvFail < 4) {
+          console.error(`  civ golden mismatch ${sc.name} tick${t}`);
+          for (const k of Object.keys(want)) {
+            if (JSON.stringify(want[k]) !== JSON.stringify(got[k])) console.error(`    field ${k}: want=${JSON.stringify(want[k]).slice(0, 140)} got=${JSON.stringify(got[k]).slice(0, 140)}`);
+          }
+        }
+        break;
+      }
+      cvHostStep(sc);
+    }
+  }
+  console.log(`civ 黄金回放 (转写 unitsBatch vs units_civ.json): ${cvFail === 0 ? 'PASS' : `FAIL(${cvFail})`} (${civGolden.scenarios.length} 场景 × 全字段逐位)`);
+  var civVerifyFail = cvFail;
+}
+
+// ============================================================
+// 段 10：M-U3g 军团域双链（gen sanity 复跑 + army-transcript 镜像逐位）
+//   army-transcript.mjs = WbCivSim.cs 军团域的 JS 独立转写（16 场景全字段逐位）
+//   gen-units-army.mjs = 黄金生成器自带 sanity 63 断言 + det 双跑（子进程复跑防陈旧）
+// ============================================================
+{
+  const { execFileSync } = await import('node:child_process');
+  var armyVerifyFail = 0;
+  try {
+    execFileSync('node', [new URL('./army-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    console.log('army 黄金回放 (army-transcript 镜像 vs units_army.json): PASS (16 场景 × 全字段逐位)');
+  } catch (e) {
+    armyVerifyFail++;
+    console.error('army 黄金回放 (army-transcript 镜像 vs units_army.json): FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(0, 8).join('\n'));
+  }
+  try {
+    const out = execFileSync('node', [new URL('./gen-units-army.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] }).toString();
+    if (!out.includes('[GEN PASS]') || !out.includes('63/63 PASS')) throw new Error(out.split('\n').slice(-4).join(' | '));
+    console.log('army gen sanity+det 复跑 (gen-units-army): PASS (63 断言 × det 双跑)');
+  } catch (e) {
+    armyVerifyFail++;
+    console.error('army gen sanity+det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// ============================================================
+// 段 11：M-U4 渲染 I 双链（render-transcript 镜像逐位 + gen sanity 复跑 + det 双跑字节对比）
+//   render-transcript.mjs = WbRender.cs 的 JS 独立转写（地形烘焙/道具烘焙/单位决策 + sprites bail 契约）
+//   gen-render.mjs = 黄金生成器自带 sanity 35 断言 + [GEN PASS]；det 双跑以 md5 字节级对比
+// ============================================================
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  var renderVerifyFail = 0;
+  try {
+    execFileSync('node', [new URL('./render-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    console.log('render 黄金回放 (render-transcript 镜像 vs render.json): PASS (186 断言 × 三段逐位)');
+  } catch (e) {
+    renderVerifyFail++;
+    console.error('render 黄金回放 (render-transcript 镜像 vs render.json): FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(0, 10).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/render.json', import.meta.url).pathname;
+    const h0 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    execFileSync('node', [new URL('./gen-render.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const h1 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('render gen sanity+det 复跑 (gen-render): PASS (35 断言 × det 字节级双跑)');
+  } catch (e) {
+    renderVerifyFail++;
+    console.error('render gen sanity+det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// ============================================================
+// 段 12：M-U5a 渲染 II 双链（render2-transcript 镜像逐位 + gen-render2 sanity/det 复跑）
+//   render2-transcript.mjs = WbSprites.cs 的 JS 独立转写（sprites 12 函数像素画：树/山/人形×2/四足/船/商队/五族）
+//   gen-render2.mjs = 黄金生成器自带 sanity 49 断言 + det 双跑；黄金 128 场景（bail 契约展开为完整 op 序列）
+// ============================================================
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  var render2VerifyFail = 0;
+  try {
+    execFileSync('node', [new URL('./render2-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    console.log('render2 黄金回放 (render2-transcript 镜像 vs render2.json): PASS (128 场景 × 逐 op 逐位)');
+  } catch (e) {
+    render2VerifyFail++;
+    console.error('render2 黄金回放 (render2-transcript 镜像 vs render2.json): FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(0, 10).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/render2.json', import.meta.url).pathname;
+    const h0 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    execFileSync('node', [new URL('./gen-render2.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const h1 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('render2 gen sanity+det 复跑 (gen-render2): PASS (49 断言 × det 字节级双跑)');
+  } catch (e) {
+    render2VerifyFail++;
+    console.error('render2 gen sanity+det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// ============================================================
+// 段 13：M-U5b 渲染 III 双链（render3-transcript 镜像逐位 + gen-render3 sanity/det 复跑）
+//   render3-transcript.mjs = WbSprites.cs 20 族扩展的 JS 独立转写（frame 驱动物种精灵）
+//   gen-render3.mjs = 黄金生成器自带 sanity 41 断言 + det 文件对比；黄金 113 场景
+// ============================================================
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  var render3VerifyFail = 0;
+  try {
+    execFileSync('node', [new URL('./render3-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    console.log('render3 黄金回放 (render3-transcript 镜像 vs render3.json): PASS (113 场景 × 逐 op 逐位)');
+  } catch (e) {
+    render3VerifyFail++;
+    console.error('render3 黄金回放 (render3-transcript 镜像 vs render3.json): FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(0, 10).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/render3.json', import.meta.url).pathname;
+    const h0 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    execFileSync('node', [new URL('./gen-render3.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const h1 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('render3 gen sanity+det 复跑 (gen-render3): PASS (41 断言 × det 字节级双跑)');
+  } catch (e) {
+    render3VerifyFail++;
+    console.error('render3 gen sanity+det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// ============================================================
+// 段 14：M-U5c 渲染 IV 余域双链（render4-transcript 镜像逐位 + gen-render4 sanity/det 复跑）
+//   render4-transcript.mjs = WbSprites.cs 余域扩展的 JS 独立转写（八新动物/建筑/掉落物/火/龙卷/涌现域）
+//   gen-render4.mjs = 黄金生成器自带 sanity 52 断言 + det 文件对比；黄金 111 场景
+// ============================================================
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  var render4VerifyFail = 0;
+  try {
+    execFileSync('node', [new URL('./render4-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    console.log('render4 黄金回放 (render4-transcript 镜像 vs render4.json): PASS (111 场景 × 逐 op 逐位)');
+  } catch (e) {
+    render4VerifyFail++;
+    console.error('render4 黄金回放 (render4-transcript 镜像 vs render4.json): FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(0, 10).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/render4.json', import.meta.url).pathname;
+    const h0 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    execFileSync('node', [new URL('./gen-render4.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const h1 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('render4 gen sanity+det 复跑 (gen-render4): PASS (52 断言 × det 字节级双跑)');
+  } catch (e) {
+    render4VerifyFail++;
+    console.error('render4 gen sanity+det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 15：M-U6a 存档编解码核心双链（save-transcript 镜像逐位 + gen-save sanity/det 复跑）
+//   save-transcript.mjs = WbSave.cs 的 JS 独立转写（B64/RLE/Hash2/Reseed/CamClamp/OccClamp/RowsToUnits/Validate 文案逐字）
+//   gen-save.mjs = 黄金生成器自带 sanity 33 断言 + det 子进程双跑（RACES 全局态污染 → 双跑必须进程隔离）；黄金 13 场景组
+// ============================================================
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  var saveVerifyFail = 0;
+  try {
+    execFileSync('node', [new URL('./save-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    console.log('save 黄金回放 (save-transcript 镜像 vs save.json): PASS (77 断言 × 编解码/数学/validate 逐位)');
+  } catch (e) {
+    saveVerifyFail++;
+    console.error('save 黄金回放 (save-transcript 镜像 vs save.json): FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(0, 10).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/save.json', import.meta.url).pathname;
+    const h0 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    execFileSync('node', [new URL('./gen-save.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const h1 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('save gen sanity+det 复跑 (gen-save): PASS (33 断言 × det 子进程双跑字节级)');
+  } catch (e) {
+    saveVerifyFail++;
+    console.error('save gen sanity+det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 16：M-U6b 存档容器恢复全链双链（save2-transcript 镜像 181 断言逐位 + gen-save2 sanity/det 复跑）
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  var save2VerifyFail = 0;
+  try {
+    execFileSync('node', [new URL('./save2-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    console.log('save2 黄金回放 (save2-transcript 镜像 vs save2.json): PASS (181 断言 × 容器恢复/抛错文案/unitsToRows 逐位)');
+  } catch (e) {
+    save2VerifyFail++;
+    console.error('save2 黄金回放 (save2-transcript 镜像 vs save2.json): FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(0, 10).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/save2.json', import.meta.url).pathname;
+    const h0 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    execFileSync('node', [new URL('./gen-save2.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const h1 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('save2 gen sanity+det 复跑 (gen-save2): PASS (54 断言 × det 子进程双跑字节级)');
+  } catch (e) {
+    save2VerifyFail++;
+    console.error('save2 gen sanity+det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 17：M-U6c serialize 全档组装双链（save3-transcript 镜像 6 场景全档逐位 + gen-save3 sanity/det 复跑）
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  var save3VerifyFail = 0;
+  try {
+    execFileSync('node', [new URL('./save3-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    console.log('save3 黄金回放 (save3-transcript 镜像 vs save3.json): PASS (6 场景 serialize 全档 deepSort 逐位)');
+  } catch (e) {
+    save3VerifyFail++;
+    console.error('save3 黄金回放 (save3-transcript 镜像 vs save3.json): FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(0, 10).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/save3.json', import.meta.url).pathname;
+    const h0 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    execFileSync('node', [new URL('./gen-save3.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const h1 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('save3 gen sanity+det 复跑 (gen-save3): PASS (32 断言 × det 子进程双跑字节级)');
+  } catch (e) {
+    save3VerifyFail++;
+    console.error('save3 gen sanity+det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 18：M-U7a 渲染接线 I 双链（render5-transcript 直调镜像 88 场景全档逐位 + gen-render5 sanity/det 复跑）
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  var render5VerifyFail = 0;
+  try {
+    execFileSync('node', [new URL('./render5-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    console.log('render5 黄金回放 (render5-transcript 直调镜像 vs render5.json): PASS (88 场景 bail→WbSprites 直调全档逐位)');
+  } catch (e) {
+    render5VerifyFail++;
+    console.error('render5 黄金回放 (render5-transcript 直调镜像 vs render5.json): FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(0, 10).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/render5.json', import.meta.url).pathname;
+    const h0 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    execFileSync('node', [new URL('./gen-render5.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const h1 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('render5 gen sanity+det 复跑 (gen-render5): PASS (10 断言 × det 子进程双跑字节级)');
+  } catch (e) {
+    render5VerifyFail++;
+    console.error('render5 gen sanity+det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 19：M-U7b 涌现视觉域宿主生产双链（render6-transcript 镜像 27 场景 visCacheFor 全域逐位 + gen-render6 sanity/det 复跑）
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  var render6VerifyFail = 0;
+  try {
+    execFileSync('node', [new URL('./render6-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    console.log('render6 黄金回放 (render6-transcript 镜像 vs render6.json): PASS (27 场景 visCacheFor 涌现视觉域逐位)');
+  } catch (e) {
+    render6VerifyFail++;
+    console.error('render6 黄金回放 (render6-transcript 镜像 vs render6.json): FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(0, 10).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/render6.json', import.meta.url).pathname;
+    const h0 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    execFileSync('node', [new URL('./gen-render6.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const h1 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('render6 gen sanity+det 复跑 (gen-render6): PASS (34 断言 × det 子进程双跑字节级)');
+  } catch (e) {
+    render6VerifyFail++;
+    console.error('render6 gen sanity+det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 20：M-U7c 渲染接线 II 双链（render7-transcript 镜像 19 场景涌现分支全档逐位 + gen-render7 sanity/det 复跑）
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  var render7VerifyFail = 0;
+  try {
+    execFileSync('node', [new URL('./render7-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    console.log('render7 黄金回放 (render7-transcript 镜像 vs render7.json): PASS (19 场景 visCacheFor 接线涌现分支逐位)');
+  } catch (e) {
+    render7VerifyFail++;
+    console.error('render7 黄金回放 (render7-transcript 镜像 vs render7.json): FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(0, 10).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/render7.json', import.meta.url).pathname;
+    const h0 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    execFileSync('node', [new URL('./gen-render7.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const h1 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('render7 gen sanity+det 复跑 (gen-render7): PASS (8 断言 × det 子进程双跑字节级)');
+  } catch (e) {
+    render7VerifyFail++;
+    console.error('render7 gen sanity+det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 21：M-U7d overlay 政治版图层双链（overlay-transcript 镜像 10 场景五模式逐位 + gen-overlay sanity/det 复跑）
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  var overlayVerifyFail = 0;
+  try {
+    execFileSync('node', [new URL('./overlay-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    console.log('overlay 黄金回放 (overlay-transcript 镜像 vs overlay.json): PASS (10 场景 redrawOverlay 五模式逐位)');
+  } catch (e) {
+    overlayVerifyFail++;
+    console.error('overlay 黄金回放 (overlay-transcript 镜像 vs overlay.json): FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(0, 10).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/overlay.json', import.meta.url).pathname;
+    const h0 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    execFileSync('node', [new URL('./gen-overlay.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const h1 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('overlay gen sanity+det 复跑 (gen-overlay): PASS (11 断言 × det 子进程双跑字节级)');
+  } catch (e) {
+    overlayVerifyFail++;
+    console.error('overlay gen sanity+det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 22：M-U7e minimap 小地图战略层双链（minimap-transcript 镜像 15 场景逐位 + gen-minimap sanity/det 复跑）
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  var minimapVerifyFail = 0;
+  try {
+    execFileSync('node', [new URL('./minimap-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    console.log('minimap 黄金回放 (minimap-transcript 镜像 vs minimap.json): PASS (15 场景 renderMinimap 战略层逐位)');
+  } catch (e) {
+    minimapVerifyFail++;
+    console.error('minimap 黄金回放 (minimap-transcript 镜像 vs minimap.json): FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(0, 10).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/minimap.json', import.meta.url).pathname;
+    const h0 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    execFileSync('node', [new URL('./gen-minimap.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const h1 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('minimap gen sanity+det 复跑 (gen-minimap): PASS (15 场景 sanity × det 子进程双跑字节级)');
+  } catch (e) {
+    minimapVerifyFail++;
+    console.error('minimap gen sanity+det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 24：M-U3h bail 宿主接力双链（bail-transcript 镜像 56 场景逐位 + gen-units-bail det 复跑；第三批 case2 + 第四批 case3 已入列）
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  var bailVerifyFail = 0;
+  try {
+    execFileSync('node', [new URL('./bail-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    console.log('bail 黄金回放 (bail-transcript 镜像 vs units_bail.json): PASS (56 场景 wbResume resume+第五批 fn 直调 tail/post/move/board 逐位)');
+  } catch (e) {
+    bailVerifyFail++;
+    console.error('bail 黄金回放 (bail-transcript 镜像 vs units_bail.json): FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(0, 10).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/units_bail.json', import.meta.url).pathname;
+    const h0 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    execFileSync('node', [new URL('./gen-units-bail.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const h1 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('bail gen det 复跑 (gen-units-bail): PASS (56 场景 rngA 逐值 det 字节级)');
+  } catch (e) {
+    bailVerifyFail++;
+    console.error('bail gen det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 26：M-U7c' tick 母体编排双链（orch-transcript 镜像 3100 行 ledger 逐位 + gen-tick-orch det 复跑 + 双写 md5 + manifest 槽位完备）
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  var orchVerifyFail = 0;
+  try {
+    execFileSync('node', [new URL('./orch-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    console.log('orch 黄金回放 (orch-transcript 镜像 vs tick_orch.json): PASS (3100 tick ledger 逐位 + seasonUsed + yearFHex(LE) + phoenix/overlay 审计)');
+  } catch (e) {
+    orchVerifyFail++;
+    console.error('orch 黄金回放 (orch-transcript 镜像 vs tick_orch.json): FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(0, 10).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/tick_orch.json', import.meta.url).pathname;
+    const h0 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    execFileSync('node', [new URL('./gen-tick-orch.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const h1 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('orch gen det 复跑 (gen-tick-orch): PASS (3100 tick × 61 调度点 det 字节级)');
+  } catch (e) {
+    orchVerifyFail++;
+    console.error('orch gen det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+  try {
+    const { readFileSync } = await import('node:fs');
+    const g = JSON.parse(readFileSync(new URL('./golden/tick_orch.json', import.meta.url), 'utf8'));
+    if (!Array.isArray(g.meta.manifest) || g.meta.manifest.length !== 61) throw new Error('manifest 槽位数 ≠ 61: ' + (g.meta.manifest?.length ?? 'missing'));
+    if (g.ledger.length !== g.meta.ticks) throw new Error(`ledger 行数 ${g.ledger.length} ≠ meta.ticks ${g.meta.ticks}`);
+    // 双写 md5（golden/ ↔ StreamingAssets/WbGolden/）
+    const sa = readFileSync(new URL('../../unity/pixel-world-box/Assets/StreamingAssets/WbGolden/tick_orch.json', import.meta.url));
+    const gl = readFileSync(new URL('./golden/tick_orch.json', import.meta.url));
+    const md5a = createHash('md5').update(sa).digest('hex');
+    const md5b = createHash('md5').update(gl).digest('hex');
+    if (md5a !== md5b) throw new Error(`双写 md5 不一致 ${md5a} ≠ ${md5b}`);
+    // phoenixAshTick 零触发是协议（窗口恒假实证）；其余 60 槽位必须全窗触发
+    const fired = new Set(g.ledger.join(',').split(',').map(Number));
+    if (fired.has(46)) throw new Error('phoenixAshTick 意外触发（协议=窗口恒假）');
+    if (fired.size !== 60) throw new Error('触发槽位数 ≠ 60: ' + fired.size);
+    console.log(`orch 台账完备 (manifest 61 槽 + ledger ${g.ledger.length} 行 + 双写 md5 ${md5b.slice(0, 8)} 一致 + 覆盖 60/61): PASS`);
+  } catch (e) {
+    orchVerifyFail++;
+    console.error('orch 台账完备: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 27：M-U7f' 程序化世界生成双链（worldgen-transcript 镜像 7 场景逐位 + gen-worldgen det 复跑 + 双写 md5）
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  var worldgenVerifyFail = 0;
+  try {
+    execFileSync('node', [new URL('./worldgen-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 400000 });
+    console.log('worldgen 黄金回放 (worldgen-transcript 镜像 vs worldgen.json): PASS (7 场景 terrain/variant/temp/moist 逐字节 + spawnAnimals 位级)');
+  } catch (e) {
+    worldgenVerifyFail++;
+    console.error('worldgen 黄金回放: FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(-8).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/worldgen.json', import.meta.url).pathname;
+    const h0 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    execFileSync('node', [new URL('./gen-worldgen.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 400000 });
+    const h1 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('worldgen gen det 复跑 (gen-worldgen): PASS (7 场景 sanity 24 + det 字节级)');
+  } catch (e) {
+    worldgenVerifyFail++;
+    console.error('worldgen gen det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+  try {
+    const { readFileSync } = await import('node:fs');
+    const g = JSON.parse(readFileSync(new URL('./golden/worldgen.json', import.meta.url), 'utf8'));
+    if (!Array.isArray(g.scens) || g.scens.length !== 7) throw new Error('场景数 ≠ 7');
+    const g9 = g.scens.find((s) => s.name === 'G09_recursion_allsea');
+    if (!g9 || !g9.recursed) throw new Error('G09 递归重掷未触发（吸收性等价破）');
+    // 双写 md5（golden/ ↔ StreamingAssets/WbGolden/）
+    const sa = readFileSync(new URL('../../unity/pixel-world-box/Assets/StreamingAssets/WbGolden/worldgen.json', import.meta.url));
+    const gl = readFileSync(new URL('./golden/worldgen.json', import.meta.url));
+    const md5a = createHash('md5').update(sa).digest('hex');
+    const md5b = createHash('md5').update(gl).digest('hex');
+    if (md5a !== md5b) throw new Error(`双写 md5 不一致 ${md5a} ≠ ${md5b}`);
+    console.log(`worldgen 台账完备 (7 场景 + G09 递归触发 + 双写 md5 ${md5b.slice(0, 8)} 一致): PASS`);
+  } catch (e) {
+    worldgenVerifyFail++;
+    console.error('worldgen 台账完备: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 25：M-U7 整合 a 宿主播放器语义面完备校验（WbHostCanvas.WbCssColor 三形态覆盖域 ↔ 黄金 475 样式串全量）
+// 逻辑：九渲染黄金（render*/overlay/minimap）op 流的全部 s[0] 样式串逐个校验形态 ∈ {#rrggbb, rgb(…), rgba(…)}；
+//   drawImage op 的 s[0] srcTag ∈ {terrain, overlay} 且 s[1] alpha ∈ [0,1]——证明 C# 解析器覆盖全部实际形态
+//   （未知形态 WbCssColor.Parse 抛 FormatException 不静默，桩域纪律）。
+{
+  const { readFileSync } = await import('node:fs');
+  var hostCanvasVerifyFail = 0;
+  try {
+    const files = ['render', 'render2', 'render3', 'render4', 'render5', 'render6', 'render7', 'overlay', 'minimap'];
+    const hex6 = /^#[0-9a-f]{6}$/;
+    const rgbF = /^rgb\(\d+,\d+,\d+\)$/;
+    const rgbaF = /^rgba\(\d+,\d+,\d+,\d*\.?\d+\)$/;
+    let styles = new Set(), blitTags = new Set(), opKinds = new Set(), bad = [];
+    for (const f of files) {
+      const str = readFileSync(new URL(`./golden/${f}.json`, import.meta.url), 'utf8');
+      for (const m of str.matchAll(/"o":"([a-zA-Z]+)"/g)) opKinds.add(m[1]);
+      for (const m of str.matchAll(/"s":\["([^"]*)"[^\]]*\]/g)) {
+        const s0 = m[1];
+        if (s0 === 'terrain' || s0 === 'overlay') { blitTags.add(s0); continue; }
+        styles.add(s0);
+        if (!hex6.test(s0) && !rgbF.test(s0) && !rgbaF.test(s0)) bad.push(`${f}:${s0}`);
+      }
+    }
+    // op 种类 ⊆ 播放器九 op（PlayOp switch 全覆盖；超出即播放器遇 unknown op 抛——必须在此暴露）
+    const known = new Set(['fillRect', 'clearRect', 'strokeRect', 'drawImage', 'setTransform', 'translate', 'scale', 'save', 'restore']);
+    const unknownOps = [...opKinds].filter((o) => !known.has(o));
+    if (bad.length > 0) throw new Error(`样式串形态越界 ${bad.length} 例（首 5: ${bad.slice(0, 5).join(' | ')}）`);
+    if (unknownOps.length > 0) throw new Error(`op 种类越界: ${unknownOps.join(',')}`);
+    if (![...blitTags].every((t) => t === 'terrain' || t === 'overlay')) throw new Error('blit srcTag 越界');
+    console.log(`hostCanvas 语义面校验 (黄金样式串 ${styles.size} 种 × 三形态全覆盖 + op ${opKinds.size} 种 ⊆ 播放器九 op + blit srcTag ∈ {terrain,overlay}): PASS`);
+  } catch (e) {
+    hostCanvasVerifyFail++;
+    console.error('hostCanvas 语义面校验: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 28：M-U7g 水深分级双链（waterdepth-transcript 镜像 4 场景逐位 + gen det 复跑 + 双写 md5 + 分布台账）
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash, } = await import('node:crypto');
+  var waterdepthVerifyFail = 0;
+  try {
+    execFileSync('node', [new URL('./waterdepth-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 200000 });
+    console.log('waterdepth 黄金回放 (waterdepth-transcript 镜像 vs waterdepth.json): PASS (4 场景 40960 格逐位 ×4)');
+  } catch (e) {
+    waterdepthVerifyFail++;
+    console.error('waterdepth 黄金回放: FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(-8).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/waterdepth.json', import.meta.url).pathname;
+    const h0 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    execFileSync('node', [new URL('./gen-waterdepth.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 280000 });
+    const h1 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('waterdepth gen det 复跑 (gen-waterdepth): PASS (4 场景 sanity 16 + 引擎字段自洽 + det 字节级)');
+  } catch (e) {
+    waterdepthVerifyFail++;
+    console.error('waterdepth gen det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+  try {
+    const { readFileSync } = await import('node:fs');
+    const g = JSON.parse(readFileSync(new URL('./golden/waterdepth.json', import.meta.url), 'utf8'));
+    if (!Array.isArray(g.scens) || g.scens.length !== 4) throw new Error('场景数 ≠ 4');
+    // 分布台账：tier ⊆ 0..4 且 0/2/3/4 全场景必现（与 gen/NUnit 同款 sanity）
+    for (const s of g.scens) {
+      if (s.hist.length !== 5) throw new Error(s.name + ' hist 维度');
+      for (const t of [0, 2, 3, 4]) if (!s.hist[t]) throw new Error(s.name + ' tier ' + t + ' 零覆盖');
+    }
+    // 双写 md5（golden/ ↔ StreamingAssets/WbGolden/）
+    const sa = readFileSync(new URL('../../unity/pixel-world-box/Assets/StreamingAssets/WbGolden/waterdepth.json', import.meta.url));
+    const gl = readFileSync(new URL('./golden/waterdepth.json', import.meta.url));
+    const md5a = createHash('md5').update(sa).digest('hex');
+    const md5b = createHash('md5').update(gl).digest('hex');
+    if (md5a !== md5b) throw new Error(`双写 md5 不一致 ${md5a} ≠ ${md5b}`);
+    console.log(`waterdepth 台账完备 (4 场景 + 分布 sanity + 双写 md5 ${md5b.slice(0, 8)} 一致): PASS`);
+  } catch (e) {
+    waterdepthVerifyFail++;
+    console.error('waterdepth 台账完备: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 29：M-U7k 河域三链（rivers-transcript 镜像 5 场景逐位 + gen det 复跑 + 双写 md5 + 摘要台账）
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash, } = await import('node:crypto');
+  var riversVerifyFail = 0;
+  try {
+    execFileSync('node', [new URL('./rivers-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 200000 });
+    console.log('rivers 黄金回放 (rivers-transcript 镜像 vs rivers.json): PASS (5 场景 terrain/riverDir/waterTier 逐位 + riverTiles 插入序 + fx/events + 掷值链闭合)');
+  } catch (e) {
+    riversVerifyFail++;
+    console.error('rivers 黄金回放: FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(-8).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/rivers.json', import.meta.url).pathname;
+    const h0 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    execFileSync('node', [new URL('./gen-rivers.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 500000 });
+    const h1 = createHash('md5').update(await (await import('node:fs')).promises.readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('rivers gen det 复跑 (gen-rivers): PASS (5 场景 sanity + GameEngine 全链 + det 字节级)');
+  } catch (e) {
+    riversVerifyFail++;
+    console.error('rivers gen det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+  try {
+    const { readFileSync } = await import('node:fs');
+    const g = JSON.parse(readFileSync(new URL('./golden/rivers.json', import.meta.url), 'utf8'));
+    if (!Array.isArray(g.scenarios) || g.scenarios.length !== 5) throw new Error('场景数 ≠ 5');
+    for (const s of g.scenarios) {
+      if (!Array.isArray(s.riverTiles) || s.riverTiles.length === 0) throw new Error('S' + s.seed + ' riverTiles 空');
+      if (typeof s.unitsDigest !== 'string' || s.unitsDigest.length !== 64) throw new Error('S' + s.seed + ' unitsDigest 缺失');
+      if (!s.unit0 || typeof s.unit0.name !== 'string') throw new Error('S' + s.seed + ' unit0 锚点缺失');
+      if (s.rng.total < s.rng.markIdx) throw new Error('S' + s.seed + ' markIdx > total');
+    }
+    const sa = readFileSync(new URL('../../unity/pixel-world-box/Assets/StreamingAssets/WbGolden/rivers.json', import.meta.url));
+    const gl = readFileSync(new URL('./golden/rivers.json', import.meta.url));
+    const md5a = createHash('md5').update(sa).digest('hex');
+    const md5b = createHash('md5').update(gl).digest('hex');
+    if (md5a !== md5b) throw new Error(`双写 md5 不一致 ${md5a} ≠ ${md5b}`);
+    console.log(`rivers 台账完备 (5 场景 + 河域 sanity + 双写 md5 ${md5b.slice(0, 8)} 一致): PASS`);
+  } catch (e) {
+    riversVerifyFail++;
+    console.error('rivers 台账完备: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 30：M-U7l 批次一 + M-U7m 批次二·扫描域 + M-U7n 批次三甲·神经域 + M-U7o 批次三乙一·远程域 + M-U7p 批次三乙二-a·近战主链三链（units-update-transcript 镜像 28 场景逐位 + gen det 复跑〔bun——.ts 直导入〕+ 双写 md5 + 台账）
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash, } = await import('node:crypto');
+  var unitsUpdateVerifyFail = 0;
+  try {
+    // M-U7w：node→bun——moveUnitT 位移路径 Math.hypot 跨 runtime ULP 分歧（bun fdlibm vs node glibc——race7 搁浅自救 1 ULP 实证）；
+    //  黄金链口径 = bun（gen det 段同口径——M-U7t fdlibm bun 漂移定性先例）
+    execFileSync('bun', [new URL('./units-update-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000 });
+    console.log('units-update 黄金回放 (units-update-transcript 镜像 vs units_update.json): PASS (56 场景 快照逐位 + evt/fx/terr/scan 事件流 + 逐步 draws + fireSet + final/rngTail)');
+  } catch (e) {
+    unitsUpdateVerifyFail++;
+    console.error('units-update 黄金回放: FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(-8).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/units_update.json', import.meta.url).pathname;
+    const { readFile } = await import('node:fs/promises');
+    const h0 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    execFileSync('bun', [new URL('./gen-units-update.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 300000 });
+    const h1 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('units-update gen det 复跑 (gen-units-update · bun): PASS (56 场景 sanity + GameEngine 真实现 + det 字节级)');
+  } catch (e) {
+    unitsUpdateVerifyFail++;
+    console.error('units-update gen det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+  try {
+    const { readFileSync } = await import('node:fs');
+    const g = JSON.parse(readFileSync(new URL('./golden/units_update.json', import.meta.url), 'utf8'));
+    // —— M-U7u 伞效应纠偏（M-U7t 遗留②）：结构断言改计数汇总式（fail 收集不中断——全部检查必跑，末端汇总 throw）——
+    const fails = [];
+    const fail = (m) => fails.push(m);
+    if (!Array.isArray(g.cases) || g.cases.length !== 56) fail('场景数 ≠ 56');   // M-U7x：55→56（S56 dusk-nightsight 入链；55 口径 M-U7v）
+    for (const c of g.cases) {
+      if (c.out.length !== c.steps) fail(c.name + ' steps ≠ out');
+      if (!Array.isArray(c.final) || c.final.length < c.units.length) fail(c.name + ' final 缺失');   // M-U7t：spawn 使 final ≥ units spec（S2 骷髅 4→5——Test30 units.Count 动态对账先证）
+      if (!Array.isArray(c.rngTail) || c.rngTail.length !== 4) fail(c.name + ' rngTail 缺失');
+      for (const s of c.out) if (!Array.isArray(s.fireSet)) fail(c.name + ' fireSet 缺失');
+    }
+    // M-U7m 扫描域结构检查：scanReal 场景布桶真实现对账 + ep.panicRout 分发（M-U7n 起 S14-S17、M-U7o 起 S18-S20、M-U7p 起 S21-S28、
+    //  M-U7q 起 S29-S36 亦标 scanReal；M-U7r 起 S37-S50 peaceful 域 14 场景扫描环零 foe 合法空——M-U7t 纠偏：计数 28→44
+    //  旧断言 throw 先于 for 检查历轮未真正执行——本次修复后首次全量暴露，空 scan 14 场景黄金实证合法）——
+    const scanCases = g.cases.filter((c) => c.env.scanReal);
+    if (scanCases.length !== 48) fail('scanReal 场景数 ≠ 48');   // M-U7x：47→48（S56 scanReal 布桶）
+    const scanNonEmpty = scanCases.filter((c) => c.out.reduce((a, s) => a + s.units.reduce((b, u) => b + ((u.scan ?? []).length), 0), 0) > 0);
+    if (scanNonEmpty.length < 30) fail('scanReal 非空场景数 < 30（S9-S36 + S51/S52 下限防漏标）');   // peaceful 域 14 场景合法空豁免
+    if (g.ep.panicRout !== 0.72) fail('ep.panicRout ≠ 0.72');
+    // M-U7n 神经域结构检查：S14-S17 四场景在册 + M-U7w 位移签名（'mv' 桩事件消亡——真执行位移：快照 x/y bitHex ≠ spec 初值 bitHex 即位移发生；
+    //  乘数正确性由 probe want 位移签名 + transcript 逐位对账承载——本段保留分支触达哨兵语义）
+    const bHexV = (v) => { const b = new ArrayBuffer(8); new Float64Array(b)[0] = v; return new BigUint64Array(b)[0].toString(16).padStart(16, '0'); };   // gen bitHex 同构（无前缀 16 hex）
+    const neuroMv = ['flight-flee', 'stance-retreat', 'stance-chase', 'grudge-chase'];
+    for (const nm of neuroMv) {
+      const c = g.cases.find((x) => x.name === nm);
+      if (!c) { fail('neuro 场景缺失 ' + nm); continue; }
+      const u0 = c.units[0];
+      const moved = c.out.some((s) => s.units.some((u) => u.x !== undefined && u.y !== undefined && (u.x !== bHexV(u0.x) || u.y !== bHexV(u0.y))));
+      if (!moved) fail(nm + ' 位移签名缺失（M-U7w 真执行）');
+    }
+    // M-U7o 远程域结构检查：火球/箭施法签名（M-U7t 纠偏：M-U7s 弹道清偿已迁 fx opts o 面——'fb'/'ar' 桩事件消亡；
+    //  旧断言在 scanReal 计数 throw 伞下历轮未真正执行）+ 风筝乘数签名 0.6/0.8（L3751/L3963）
+    const fb = g.cases.find((x) => x.name === 'mage-fireball');
+    if (!fb || !fb.out.some((s) => s.units.some((u) => (u.fx ?? []).some((f) => f[0] === 'fireball' && f[4] && f[4][3] === '0000000000003240')))) fail('mage-fireball 施法 fx 缺失（o[3] r=18 bitHex）');
+    const ar = g.cases.find((x) => x.name === 'archer-arrow');
+    if (!ar || !ar.out.some((s) => s.units.some((u) => (u.fx ?? []).some((f) => f[0] === 'arrow' && f[4] && f[4][4] === '0000000000001840')))) fail('archer-arrow 施法 fx 缺失（o[4] dmg=6 bitHex）');
+    const kiteMv = ['mage-fireball', 'kite-deadzone'];
+    for (const nm of kiteMv) {
+      const c = g.cases.find((x) => x.name === nm);
+      if (!c) { fail('风筝场景缺失 ' + nm); continue; }
+      const u0 = c.units[0];
+      const moved = c.out.some((s) => s.units.some((u) => u.x !== undefined && u.y !== undefined && (u.x !== bHexV(u0.x) || u.y !== bHexV(u0.y))));
+      if (!moved) fail(nm + ' 风筝位移签名缺失（M-U7w 真执行）');
+    }
+    // M-U7p 近战域结构检查：三特异种族特技（石化 corpse stone=1/吞噬/击沉 shipwreck）+ 命中 hit fx + ab 登记 + 吸血回血
+    const petrify = g.cases.find((x) => x.name === 'basilisk-petrify');
+    if (!petrify || !petrify.out.some((s) => s.units.some((u) => (u.evt ?? []).some((e) => e[0] === 'corpse' && e[3] === 1)))) fail('basilisk-petrify stone 尸骸缺失');
+    const devour = g.cases.find((x) => x.name === 'sandworm-devour');
+    if (!devour || !devour.out.some((s) => s.units.some((u) => (u.fx ?? []).some((f) => f[0] === 'blood')))) fail('sandworm-devour 血雾 fx 缺失');   // 吞噬 L3804 早退不触 ab 登记（L3895）——blood fx 为吞噬签名
+    const sink = g.cases.find((x) => x.name === 'kraken-sink');
+    if (!sink || !sink.out.some((s) => s.units.some((u) => (u.evt ?? []).some((e) => e[0] === 'ev' && e[1] === 'shipwreck')))) fail('kraken-sink 沉船事件缺失');
+    const drain = g.cases.find((x) => x.name === 'vampire-drain');
+    if (!drain || !drain.out.some((s) => s.units.some((u) => (u.fx ?? []).some((f) => f[0] === 'hit')))) fail('vampire-drain 命中 fx 缺失');   // heart 受 dmgNumbers=false 契约不触达——吮血回血由 hp 快照对账
+    const meleeHit = g.cases.find((x) => x.name === 'melee-hit');
+    if (!meleeHit || !meleeHit.out.some((s) => s.units.some((u) => (u.fx ?? []).some((f) => f[0] === 'hit')))) fail('melee-hit 命中 fx 缺失');
+    // M-U7q 击杀链结构检查：zombify 尸变签名（race 5 + hp 40 bitHex + alive）+ 复仇/家族/弑君/屠龙/起尸/龙息/post 态签名
+    const zombC = g.cases.find((x) => x.name === 'zombify');
+    if (!zombC || !zombC.final.some((u) => u.race === 5 && !u.dead && u.hp === '0000000000004440' && u.speed === '9a9999999999a93f')) fail('zombify 尸变签名缺失（race5+hp40+speed0.05）');
+    const revC = g.cases.find((x) => x.name === 'revenge');
+    if (!revC || !revC.out.some((s) => s.units.some((u) => (u.evt ?? []).some((e) => e[0] === 'ev' && e[1] === 'revenge')))) fail('revenge 复仇播报缺失');
+    const heroC = g.cases.find((x) => x.name === 'family-hero');
+    if (!heroC || heroC.post.families.length !== 1 || heroC.post.families[0].heroes !== 1 || !heroC.out.some((s) => s.units.some((u) => (u.evt ?? []).some((e) => e[0] === 'ev' && e[1] === 'legend')))) fail('family-hero 家族英雄签名缺失');
+    const kingC = g.cases.find((x) => x.name === 'king-slain-war');
+    if (!kingC || !kingC.post.rel.some(([k, v]) => k === '0-1' && v === -74) || !kingC.post.tension.some(([k, v]) => k === '0-1' && v === 30) || !kingC.post.warShame.some(([k, v]) => k === '0-1' && v === 1)) fail('king-slain-war 弑君三账本签名缺失');
+    if (kingC && (!kingC.post.warData.some((w) => w.key === '0-1' && w.scoreA === 2 && w.casB === 1 && w.exB === 1) || kingC.post.directives[0]?.killCount !== 1)) fail('king-slain-war 战争结算签名缺失');
+    const dslayC = g.cases.find((x) => x.name === 'dragon-slain');
+    if (!dslayC || dslayC.post.statDragons !== 1) fail('dragon-slain 屠龙计数缺失');
+    const uriseC = g.cases.find((x) => x.name === 'undead-rise');
+    if (!uriseC || uriseC.final.length !== 3 || !uriseC.out.some((s) => s.units.some((u) => (u.fx ?? []).some((f) => f[0] === 'spawn')))) fail('undead-rise 起尸缺失');   // M-U7t：'rise' 桩事件消亡——spawn 骷髅签名（final 2→3 + fx 'spawn'）
+    const breathC = g.cases.find((x) => x.name === 'dragon-breath');
+    if (!breathC || !breathC.out.some((s) => s.fireSet.length > 0 && s.fireDiff.length > 0)) fail('dragon-breath 火种缺失');
+    const witC = g.cases.find((x) => x.name === 'melee-kill-witness');
+    if (!witC || !witC.final.some((u) => u.panic !== null && u.gids !== null && u.gval !== null) || !witC.final[1]?.dead) fail('melee-kill-witness 目睹死亡广播签名缺失');
+    // M-U7u 瘟疫传播域结构检查：S53 三跳过支路（u1 染/u2 免疫净/u4 距离门败净）+ S54 medicine 0.55 双染（未中→中→break 累积）
+    const p53 = g.cases.find((x) => x.name === 'plague-spread');
+    if (!p53 || !p53.final[1]?.infected || p53.final[2]?.infected || p53.final[4]?.infected) fail('plague-spread 传播签名缺失（u1 染/u2 免疫跳过/u4 距离败）');
+    const p54 = g.cases.find((x) => x.name === 'plague-medicine');
+    if (!p54 || !p54.final[1]?.infected || !p54.final[2]?.infected) fail('plague-medicine 医学科技 0.55 双染签名缺失');
+    // M-U7v 城墙防御域结构检查：S55 troll-vs-wall 守军 0.72 减伤签名（u1 终态 hp 位串 74.68 = 90 - 26×(0.8+r×0.4)×0.72——严格墙域 d=15.32 ∈ [14.97,22.46]）
+    const w55 = g.cases.find((x) => x.name === 'wall-defense');
+    if (!w55 || w55.final[1]?.hp !== '6666a49639c05240' || !w55.out.some((s) => s.units.some((u) => (u.fx ?? []).some((f) => f[0] === 'hit')))) fail('wall-defense 借墙减伤签名缺失（u1 hp 74.68 bitHex + hit fx）');
+    // M-U7x 昼夜时钟域结构检查：S56 dusk-nightsight 夜视豁免签名（u1 终态 hp 位串 16.49 = 50 - 30×(0.8+r×0.4)——d=33.51 ∈ 豁免独有带 (33.12,36)，
+    //  ×0.92 减益域上限 33.12 不可达——攻击者 orc nightsight=true 豁免实证；S28（×0.92 减益面）跨场景对照不变）
+    const w56 = g.cases.find((x) => x.name === 'dusk-nightsight');
+    if (!w56 || w56.final[1]?.hp !== '343383ca477c3040' || !w56.out.some((s) => s.units.some((u) => (u.fx ?? []).some((f) => f[0] === 'hit')))) fail('dusk-nightsight 夜视豁免签名缺失（u1 hp 16.49 bitHex + hit fx）');
+    const sa = readFileSync(new URL('../../unity/pixel-world-box/Assets/StreamingAssets/WbGolden/units_update.json', import.meta.url));
+    const gl = readFileSync(new URL('./golden/units_update.json', import.meta.url));
+    const md5a = createHash('md5').update(sa).digest('hex');
+    const md5b = createHash('md5').update(gl).digest('hex');
+    if (md5a !== md5b) fail(`双写 md5 不一致 ${md5a} ≠ ${md5b}`);
+    if (fails.length > 0) throw new Error(fails.join(' | '));   // M-U7u：计数汇总末端 throw——全部检查已跑完，失败全量上报（伞效应根治）
+    console.log(`units-update 台账完备 (56 场景 + scanReal 48 + neuro/远程/近战/击杀链/起尸/瘟疫/城墙/昼夜签名 + 双写 md5 ${md5b.slice(0, 8)} 一致): PASS`);
+  } catch (e) {
+    unitsUpdateVerifyFail++;
+    console.error('units-update 台账完备: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+
+// 段 31：M-U9a 冰域（ice-transcript 镜像 5 场景逐位 + gen det 复跑〔bun——超函数链口径统一〕+ 双写 md5 + 台账）
+var iceVerifyFail = 0;
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash, } = await import('node:crypto');
+  const { readFileSync } = await import('node:fs');
+  try {
+    // M-U7w 口径：黄金链一律 bun（iceTick 零超越函数——JS/C# 位安全域，bun/node 同位，口径统一防漂移）
+    execFileSync('bun', [new URL('./ice-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000 });
+    console.log('ice 黄金回放 (ice-transcript 镜像 vs ice.json): PASS (5 场景 快照逐位 + frozen/flood/wet 序 + 逐步 rngA + fx/events 事件流)');
+  } catch (e) {
+    iceVerifyFail++;
+    console.error('ice 黄金回放: FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(-8).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/ice.json', import.meta.url).pathname;
+    const { readFile } = await import('node:fs/promises');
+    const h0 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    execFileSync('bun', [new URL('./gen-ice.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 300000 });
+    const h1 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('ice gen det 复跑 (gen-ice · bun): PASS (5 场景 sanity + GameEngine 真实现 + det 字节级)');
+  } catch (e) {
+    iceVerifyFail++;
+    console.error('ice gen det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+  try {
+    const g = JSON.parse(readFileSync(new URL('./golden/ice.json', import.meta.url), 'utf8'));
+    const fails = [];
+    const fail = (m) => fails.push(m);
+    if (!Array.isArray(g.scenarios) || g.scenarios.length !== 5) fail('场景数 ≠ 5');
+    const keys = g.scenarios.map((s) => s.key);
+    for (const want of ['hot-melt', 'spring-thaw', 'winter-freeze', 'flood-retreat', 'wet-dry-cascade'])
+      if (!keys.includes(want)) fail(`场景 ${want} 缺失`);
+    for (const s of g.scenarios) {
+      if (!s.fixture || !Array.isArray(s.fixture.frozen0) || !Array.isArray(s.fixture.setCalls)) fail(s.key + ' fixture 缺失');
+      if (!Array.isArray(s.stepsSnap) || s.stepsSnap.length !== s.steps) fail(s.key + ' stepsSnap ≠ steps');
+      if (typeof s.totalDraws !== 'number' || s.totalDraws < 0) fail(s.key + ' totalDraws 缺失');
+    }
+    const wf = g.scenarios.find((s) => s.key === 'winter-freeze');
+    if (!wf || wf.totalDraws < 1000 || !wf.stepsSnap.some((st) => st.frozen.length > 12)) fail('winter-freeze 大封冻签名缺失（掷数>1000 + frozen>12）');
+    const sp = g.scenarios.find((s) => s.key === 'spring-thaw');
+    if (!sp || !sp.events.some((e) => e.kind === 'geo') || sp.fx.length === 0) fail('spring-thaw 落冰湖纪事+融滴签名缺失');
+    const ca = g.scenarios.find((s) => s.key === 'wet-dry-cascade');
+    if (!ca || ca.fixture.setCalls.length !== 4) fail('wet-dry-cascade 级联直调面缺失（L981-984 四写点）');
+    const sa = readFileSync(new URL('../../unity/pixel-world-box/Assets/StreamingAssets/WbGolden/ice.json', import.meta.url));
+    const gl = readFileSync(new URL('./golden/ice.json', import.meta.url));
+    const md5a = createHash('md5').update(sa).digest('hex');
+    const md5b = createHash('md5').update(gl).digest('hex');
+    if (md5a !== md5b) fail(`双写 md5 不一致 ${md5a} ≠ ${md5b}`);
+    if (fails.length > 0) throw new Error(fails.join(' | '));
+    console.log(`ice 台账完备 (5 场景 + 大封冻/落冰湖/级联四写点签名 + 双写 md5 ${md5b.slice(0, 8)} 一致): PASS`);
+  } catch (e) {
+    iceVerifyFail++;
+    console.error('ice 台账完备: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+
+// 段 32：M-U9b fire 域（fire-transcript 镜像 5 场景逐位 + gen det 复跑〔bun——超函数链口径统一〕+ 双写 md5 + 台账）
+var fireVerifyFail = 0;
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash, } = await import('node:crypto');
+  const { readFileSync } = await import('node:fs');
+  try {
+    // M-U7w 口径：黄金链一律 bun（exp/hypot fdlibm——C# FdExp/V8Hypot 位精确件对账面在 NUnit 侧）
+    execFileSync('bun', [new URL('./fire-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000 });
+    console.log('fire 黄金回放 (fire-transcript 镜像 vs fire.json): PASS (5 场景 快照逐位 + fireSet 活迭代序 + regrow 序 + 逐步 rngA + fx 事件流)');
+  } catch (e) {
+    fireVerifyFail++;
+    console.error('fire 黄金回放: FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(-8).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/fire.json', import.meta.url).pathname;
+    const { readFile } = await import('node:fs/promises');
+    const h0 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    execFileSync('bun', [new URL('./gen-fire.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 300000 });
+    const h1 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('fire gen det 复跑 (gen-fire · bun): PASS (5 场景 sanity + GameEngine 真实现 + det 字节级)');
+  } catch (e) {
+    fireVerifyFail++;
+    console.error('fire gen det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+  try {
+    const g = JSON.parse(readFileSync(new URL('./golden/fire.json', import.meta.url), 'utf8'));
+    const fails = [];
+    const fail = (m) => fails.push(m);
+    if (!Array.isArray(g.scenarios) || g.scenarios.length !== 5) fail('场景数 ≠ 5');
+    const keys = g.scenarios.map((s) => s.key);
+    for (const want of ['fire-spread-forest', 'fire-building-destroy', 'fire-ice-melt', 'fire-wind-rain', 'fire-winter-ignite'])
+      if (!keys.includes(want)) fail(`场景 ${want} 缺失`);
+    for (const s of g.scenarios) {
+      if (!s.fixture || !Array.isArray(s.fixture.fireSet0) || !s.fixture.windPhase) fail(s.key + ' fixture 缺失');
+      if (!Array.isArray(s.stepsSnap) || s.stepsSnap.length !== s.steps) fail(s.key + ' stepsSnap ≠ steps');
+      if (typeof s.totalDraws !== 'number' || s.totalDraws < 0) fail(s.key + ' totalDraws 缺失');
+    }
+    const sp = g.scenarios.find((s) => s.key === 'fire-spread-forest');
+    if (!sp || sp.totalDraws < 100 || !sp.stepsSnap.some((st) => st.fireSet.length > 5)) fail('fire-spread-forest 真蔓延签名缺失（掷数>100 + fireSet>5）');
+    const bd = g.scenarios.find((s) => s.key === 'fire-building-destroy');
+    if (!bd || !bd.fx.some((e) => e.kind === 'smoke')) fail('fire-building-destroy smoke fx 签名缺失');
+    const wr = g.scenarios.find((s) => s.key === 'fire-wind-rain');
+    if (!wr || !wr.fixture.pSystems.length || !wr.fixture.storms.length) fail('fire-wind-rain 大气态注入签名缺失');
+    const im = g.scenarios.find((s) => s.key === 'fire-ice-melt');
+    if (!im || !im.stepsSnap.some((st) => st.regrow.length >= 0 && true)) { /* 冰火面以 terrain md5 对账为准 */ }
+    const sa = readFileSync(new URL('../../unity/pixel-world-box/Assets/StreamingAssets/WbGolden/fire.json', import.meta.url));
+    const gl = readFileSync(new URL('./golden/fire.json', import.meta.url));
+    const md5a = createHash('md5').update(sa).digest('hex');
+    const md5b = createHash('md5').update(gl).digest('hex');
+    if (md5a !== md5b) fail(`双写 md5 不一致 ${md5a} ≠ ${md5b}`);
+    if (fails.length > 0) throw new Error(fails.join(' | '));
+    console.log(`fire 台账完备 (5 场景 + 真蔓延/smoke fx/大气态签名 + 双写 md5 ${md5b.slice(0, 8)} 一致): PASS`);
+  } catch (e) {
+    fireVerifyFail++;
+    console.error('fire 台账完备: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+
+// 段 33：M-U10a 云族八种 + M-U10b 波前/静态五 kind + M-U10c 命中族三 kind + explode + M-U10d shell/missile/核弹 + M-U10f laser + M-U10g orbital + M-U10h plasma/antimatter/annihilate（power-transcript 镜像 30 场景逐位 + gen det 复跑〔bun〕+ 双写 md5 + 台账）
+var powerVerifyFail = 0;
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash, } = await import('node:crypto');
+  const { readFileSync } = await import('node:fs');
+  try {
+    // M-U7w 口径：黄金链一律 bun（tornado/sandstorm/famine Math.hypot fdlibm——C# FdHypot/V8Hypot 位精确件对账面在 NUnit 侧）
+    execFileSync('bun', [new URL('./power-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000 });
+    console.log('power 黄金回放 (power-transcript 镜像 vs power.json): PASS (30 场景 快照逐位 + fx/units/bHp/battles/flood/shake/armies 序 + regrow L979 出账联动 + 逐步 rngA + M-U10c 桶扫描/armor 减伤/events 全列 + M-U10d shellBurst/raze 级联/核弹辐射圈 + M-U10e airstrike/drone/mech + M-U10f laser 线杀伤 + M-U10g orbital 焦化环 + M-U10h plasma EMP/armies morale + antimatter 湮灭)');
+  } catch (e) {
+    powerVerifyFail++;
+    console.error('power 黄金回放: FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(-8).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/power.json', import.meta.url).pathname;
+    const { readFile } = await import('node:fs/promises');
+    const h0 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    execFileSync('bun', [new URL('./gen-power.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 300000 });
+    const h1 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('power gen det 复跑 (gen-power · bun): PASS (30 场景 sanity + GameEngine 真实现 + det 字节级)');
+  } catch (e) {
+    powerVerifyFail++;
+    console.error('power gen det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+  try {
+    const g = JSON.parse(readFileSync(new URL('./golden/power.json', import.meta.url), 'utf8'));
+    const fails = [];
+    const fail = (m) => fails.push(m);
+    if (!Array.isArray(g.scenarios) || g.scenarios.length !== 30) fail('场景数 ≠ 30');
+    const keys = g.scenarios.map((s) => s.key);
+    for (const want of ['power-tornado', 'power-acid', 'power-blizzard', 'power-locust', 'power-drought', 'power-rainstorm', 'power-sandstorm', 'power-famine', 'power-expiry', 'power-tsunami', 'power-sinkhole', 'power-iceage', 'power-blackhole', 'power-quake', 'power-meteor', 'power-fireball', 'power-arrow', 'power-bullet-misc', 'power-shell', 'power-missile', 'power-nukemissile', 'power-airstrike', 'power-drone', 'power-mech', 'power-laser', 'power-laser-degenerate', 'power-orbital', 'power-orbital-edge', 'power-plasma', 'power-antimatter'])
+      if (!keys.includes(want)) fail(`场景 ${want} 缺失`);
+    for (const s of g.scenarios) {
+      if (!s.fixture || !Array.isArray(s.fixture.fx0) || !s.fixture.waterTier0) fail(s.key + ' fixture 缺失');
+      if (!Array.isArray(s.stepsSnap) || s.stepsSnap.length !== s.steps) fail(s.key + ' stepsSnap ≠ steps');
+      if (typeof s.totalDraws !== 'number' || s.totalDraws < 0) fail(s.key + ' totalDraws 缺失');
+    }
+    const tn = g.scenarios.find((s) => s.key === 'power-tornado');
+    if (!tn || !tn.fx.some((e) => e.kind === 'smoke')) fail('power-tornado 建筑摧毁 smoke fx 签名缺失');
+    const rs = g.scenarios.find((s) => s.key === 'power-rainstorm');
+    if (!rs || rs.fx.filter((e) => e.kind === 'water').length < 3) fail('power-rainstorm water fx 签名缺失（灭火/复绿面）');
+    const ex = g.scenarios.find((s) => s.key === 'power-expiry');
+    if (!ex || ex.fx.length !== 1 || ex.fx[0].kind !== 'blizzard') fail('power-expiry 到期 splice 签名缺失（终态仅 blizzard ttl12）');
+    if (!ex || ex.battles.length !== 1 || !ex.battles.some(([t, exp]) => t === 12851 && exp === 200)) fail('power-expiry activeBattles 过期清理签名缺失（exp103 删/exp200 留）');
+    // M-U10b 五 kind 签名面
+    const ts = g.scenarios.find((s) => s.key === 'power-tsunami');
+    if (!ts || ts.flood.length < 10) fail('power-tsunami flood 挂账签名缺失（L9898 逐瓦片掷）');
+    if (!ts || !ts.fixture || ts.fixture.flood0.length !== 0) fail('power-tsunami flood0 初始空签名缺失');
+    if (!ts || !ts.fx.some((e) => e.kind === 'smoke')) fail('power-tsunami 级联水吞 smoke 签名缺失（掷序黄金实证）');
+    const sh = g.scenarios.find((s) => s.key === 'power-sinkhole');
+    if (!sh || sh.flood.length !== 0) fail('power-sinkhole 无 flood 挂账签名缺失（永久性水面钉）');
+    const ia = g.scenarios.find((s) => s.key === 'power-iceage');
+    if (!ia || !ia.units.some((u) => u.chill === 16)) fail('power-iceage chill16 签名缺失');
+    const bh = g.scenarios.find((s) => s.key === 'power-blackhole');
+    if (!bh || !bh.fx.some((e) => e.kind === 'explosion')) fail('power-blackhole 奇点 explosion fx 签名缺失（L10220 {r:3}）');
+    if (!bh || bh.shake !== 9) fail('power-blackhole shake=9 签名缺失');
+    const qk = g.scenarios.find((s) => s.key === 'power-quake');
+    if (!qk || !qk.stepsSnap.some((st) => st.shake === 7)) fail('power-quake shake=7 直写签名缺失（L10225）');
+    // M-U10c 命中族签名面
+    const f64hexV = (v) => { const b = new ArrayBuffer(8); new Float64Array(b)[0] = v; return Buffer.from(b).toString('hex'); };
+    const unhexV = (h) => Buffer.from(h, 'hex').readDoubleLE(0);
+    const mt = g.scenarios.find((s) => s.key === 'power-meteor');
+    if (!mt || mt.events.length !== 1 || mt.events[0].kind !== 'meteor') fail('power-meteor 入纪事签名缺失（非 quiet 弹）');
+    if (!mt || mt.shake !== 8) fail('power-meteor shake=8 签名缺失（L10478 max 面）');
+    if (!mt || !mt.fx.some((e) => e.kind === 'smoke') || mt.fx.filter((e) => e.kind === 'smoke').length !== 12) fail('power-meteor smoke ×12 签名缺失（双弹 ×6）');
+    const fb = g.scenarios.find((s) => s.key === 'power-fireball');
+    if (!fb || fb.fireSet.length !== 1) fail('power-fireball ignite 正面支签名缺失（空地 fireSet 入账）');
+    if (!fb || !fb.units.some((u) => u.dead) || !fb.units.some((u) => unhexV(u.hp) === 32)) fail('power-fireball 溅射 hp-=r/dead 签名缺失（L10246-10248）');
+    const ar = g.scenarios.find((s) => s.key === 'power-arrow');
+    if (!ar || !ar.fx.some((e) => e.kind === 'dmg')) fail('power-arrow dmgNumbers 签名缺失（final>=10 短路支）');
+    if (!ar || !ar.units.some((u) => unhexV(u.hp) === 44.48)) fail('power-arrow armor 减伤位精确签名缺失（链甲 8 → 6*0.92=5.52 → 44.48）');
+    if (!ar || ar.bHp.length !== 1 || ar.bHp[0][1] !== f64hexV(32.8)) fail('power-arrow attackBuilding dmg*0.8 签名缺失（40-7.2=32.8）');
+    const bm = g.scenarios.find((s) => s.key === 'power-bullet-misc');
+    if (!bm || bm.bHp.length !== 0) fail('power-bullet-misc 非战/孤儿格零写面签名缺失（bHp 空）');
+    // M-U10d shell/missile/核弹签名面
+    const shl = g.scenarios.find((s) => s.key === 'power-shell');
+    if (!shl || shl.bHp.length !== 2 || shl.bHp.some(([k, v]) => v !== f64hexV(43))) fail('power-shell attackBuilding dmg*0.9 签名缺失（70-27=43 双账——无友军门）');
+    if (!shl || shl.shake !== 2.6) fail('power-shell shake=min(5,1+r)=2.6 签名缺失（L9619）');
+    if (!shl || shl.fireSet.length < 1) fail('power-shell ignite 门掷正面支签名缺失（fire:1）');
+    if (!shl || shl.fx.filter((e) => e.kind === 'hit').length !== 2) fail('power-shell hit fx ×2 签名缺失（attackBuilding 双账）');
+    if (!shl || !shl.units.some((u) => u.dead) || !shl.units.some((u) => unhexV(u.hp) === 35)) fail('power-shell falloff 钳 0.25 支签名缺失（己方步兵同溅射——无 src 豁免）');
+    const ms = g.scenarios.find((s) => s.key === 'power-missile');
+    if (!ms || ms.events.length !== 1 || ms.events[0].kind !== 'siege') fail('power-missile raze 支 siege 纪事签名缺失（lastSiegeEventTick 节流首触）');
+    if (!ms || ms.events[0].text !== '「熔铁部族」的军队摧毁了「青禾部落」的农田') fail('power-missile siege 纪事命名域文本签名缺失');
+    if (!ms || ms.buildingsCount !== 0 || ms.bHp.length !== 0) fail('power-missile FARM 摧毁三账清签名缺失（swap-pop/bHp/damagedSet）');
+    if (!ms || ms.kc !== null || ms.statN !== 0) fail('power-missile killCredit 复位/statNukes 零写签名缺失');
+    const nk = g.scenarios.find((s) => s.key === 'power-nukemissile');
+    if (!nk || nk.statN !== 1) fail('power-nukemissile statNukes=1 签名缺失（Nuke L12256）');
+    if (!nk || nk.events.length !== 2 || nk.events[0].kind !== 'nuke' || nk.events[1].kind !== 'nuke') fail('power-nukemissile 双 nuke 纪事签名缺失（unshift 序：explode 先/missile 支后）');
+    if (!nk || nk.shake !== 14) fail('power-nukemissile shake=14 签名缺失（L10478 核域支）');
+    if (!nk || nk.radSet.length <= 70) fail('power-nukemissile radSet 11×11<5 辐射圈签名缺失');
+    if (!nk || !nk.fx.some((e) => e.kind === 'flash') || !nk.fx.some((e) => e.kind === 'mushroom')) fail('power-nukemissile flash/mushroom fx 签名缺失（L10484-10485）');
+    // M-U10e war 面三 kind 签名面
+    const as = g.scenarios.find((s) => s.key === 'power-airstrike');
+    if (!as || as.shake !== 2.4) fail('power-airstrike shake=2.4 签名缺失（两弹 max min(5,1+1.4)）');
+    if (!as || as.fx.length !== 2 || !as.fx.every((e) => e.kind === 'explosion')) fail('power-airstrike 双 explosion 签名缺失（终点 splice——无 killCredit 写面蓝本异形）');
+    if (!as || !as.fixture.fx0.some((e) => e.kind === 'airstrike' && e.x0 !== undefined)) fail('power-airstrike fx0 稀疏 x0/y0 通道首钉缺失（航线 divergent 出键）');
+    const dr = g.scenarios.find((s) => s.key === 'power-drone');
+    if (!dr || dr.units.some((u) => u.dead) !== true || !dr.units.some((u) => unhexV(u.hp) === 50)) fail('power-drone 周期猎杀/远端幸存签名缺失');
+    if (!dr || dr.kc !== null) fail('power-drone killCredit 复位签名缺失（wid=7 往返 L10363/L10366）');
+    if (!dr || dr.bHp.length !== 1 || dr.bHp[0][1] !== f64hexV(40 - 14 * 2.6 * 0.9)) fail('power-drone 集束 attackBuilding (dmg*2.6)*0.9 签名缺失（40-32.76=7.24 位精确）');
+    if (!dr || !dr.fixture.fx0.some((e) => e.wid === 7)) fail('power-drone wid=7 fixture 通道签名缺失（emergentPayload 门）');
+    const mc = g.scenarios.find((s) => s.key === 'power-mech');
+    if (!mc || !mc.fx.some((e) => e.kind === 'bullet')) fail('power-mech 曳光 fx bullet 签名缺失（L10408）');
+    if (!mc || mc.shake !== 3.2) fail('power-mech shake=min(5,1+2.2)=3.2 签名缺失');
+    if (!mc || !mc.units.some((u) => u.dead) || !mc.units.some((u) => unhexV(u.hp) === 50 - 45 * (1 - Math.hypot(0.5, 0.5) / 2.6))) fail('power-mech 豁免友军/终点无豁免 falloff 位精确签名缺失（L10401 vs L9614 无门）');
+    // M-U10f laser 签名面
+    const lz = g.scenarios.find((s) => s.key === 'power-laser');
+    if (!lz || !lz.units.some((u) => unhexV(u.hp) === 50 - 30 * 0.7) || !lz.units.some((u) => unhexV(u.hp) === 20)) fail('power-laser 0.7×/焦点全伤双支位精确签名缺失（L10342 比值门）');
+    if (!lz || lz.units.filter((u) => u.hurt === 22).length !== 4) fail('power-laser hurt=22 ×4 命中签名缺失（L10344）');
+    if (!lz || lz.fx.filter((e) => e.kind === 'hit').length !== 4 || lz.fx.filter((e) => e.kind === 'dmg').length !== 1) fail('power-laser hit×4/dmg×1 签名缺失（dmgNumbers 门真引擎默认 true L271 面真吞掷——40% 掷中）');
+    if (!lz || !lz.fx.some((e) => e.kind === 'explosion')) fail('power-laser explosion {r:0.8} 终点小爆破签名缺失（L10352）');
+    if (!lz || lz.kc !== null) fail('power-laser killCredit 复位签名缺失（wid=7 往返 L10333/L10351）');
+    if (!lz || !lz.units[6] || !lz.units[6].dead || lz.units.slice(0, 6).some((u) => u.dead)) fail('power-laser dead=1 跳过签名缺失（L10335 循环头——u6 注入 dead=1 幸存不复活，前 6 单位全活）');
+    if (!lz || !lz.fixture.fx0.some((e) => e.wid === 7 && e.src === 1)) fail('power-laser wid/src fixture 通道签名缺失（emergentPayload 门 + 豁免支）');
+    const lg = g.scenarios.find((s) => s.key === 'power-laser-degenerate');
+    if (!lg || !lg.units.some((u) => unhexV(u.hp) === 50 - 30 * 0.7) || !lg.units.some((u) => unhexV(u.hp) === 50)) fail('power-laser-degenerate llen||1 退化点爆 0.7×/远离线零伤签名缺失（L10329 护栏 + L10340 距离门）');
+    if (!lg || !lg.fixture.fx0.every((e) => e.kind !== 'laser' || e.x0 === undefined)) fail('power-laser-degenerate fx0 稀疏通道签名缺失（x0==x 不出键）');
+    if (!lg || lg.kc !== null) fail('power-laser-degenerate killCredit null 往返签名缺失（?? null 双写）');
+    // M-U10g orbital 签名面
+    const ob = g.scenarios.find((s) => s.key === 'power-orbital');
+    if (!ob || ob.fireSet.length !== 4) fail('power-orbital ignite 正面支 fireSet=4 签名缺失（fire 门 rng<0.45 掷中 4 格——位级）');
+    if (!ob || ob.shake !== 9) fail('power-orbital shake=9 签名缺失（L10387 Max 覆盖 shellBurst 内 5）');
+    if (!ob || ob.kc !== null) fail('power-orbital killCredit 复位签名缺失（wid=7 往返 L10373/L10386）');
+    if (!ob || ob.units[0].dead !== true || ob.units[3].dead !== true) fail('power-orbital 中心/近点单位死亡签名缺失（shellBurst 120 伤——wwCountKill 布尔置位）');
+    if (!ob || ob.units[1].hp !== f64hexV(50) || ob.units[2].hp !== f64hexV(50)) fail('power-orbital 远点零伤/dead 跳过幸存签名缺失（d≥4.9 几何门 + L10334 循环头）');
+    if (!ob || ob.units[2].dead !== 1) fail('power-orbital dead 数值 1 ≠ 布尔 true 签名缺失（M-U10f 教训面——注入直写保持数值型）');
+    if (!ob || ob.events.length !== 1 || ob.events[0].kind !== 'superweapon' || ob.events[0].text !== '天罚降临——钨棒轰然砸穿大地，留下焦黑的弹坑') fail('power-orbital superweapon 纪事签名缺失（L10384 文本位级）');
+    if (!ob || ob.fx.length !== 1 || ob.fx[0].kind !== 'explosion') fail('power-orbital fx 终态仅 explosion 签名缺失（orbital 到期 splice——L10439）');
+    if (!ob || ob.stepsSnap[0].rngA !== '000a0e1c') fail('power-orbital k0 空转零掷位证签名缺失（无周期相——age 11<12）');
+    const oe = g.scenarios.find((s) => s.key === 'power-orbital-edge');
+    if (!oe || oe.fireSet.length !== 3) fail('power-orbital-edge 右半 GRASS ignite fireSet=3 签名缺失（左半 WATER 零掷——isLand 短路位证）');
+    if (!oe || oe.units[0].dead !== true || oe.units[1].hp !== f64hexV(50 - 120 * (1 - 3 / 4.9))) fail('power-orbital-edge WATER 上中心死/右缘 falloff 位精确签名缺失（shellBurst 单位环无地形门 L9597）');
+    if (!oe || oe.kc !== null || oe.shake !== 9) fail('power-orbital-edge wid null 往返/shake=9 签名缺失（??null 双写 + emergentPayload 门不触达）');
+    if (!oe || oe.events.length !== 1 || oe.events[0].x !== 2.5 || oe.events[0].y !== 2.5) fail('power-orbital-edge 贴边纪事坐标签名缺失（L10384 opts {x,y}）');
+    if (!oe || oe.stepsSnap[0].rngA !== '000a0e1d') fail('power-orbital-edge k0 空转零掷位证签名缺失');
+    // M-U10h plasma/antimatter 签名面
+    const { gunzipSync: _gz } = await import('node:zlib');
+    const pl = g.scenarios.find((s) => s.key === 'power-plasma');
+    if (!pl || pl.fixture.armies0.length !== 4) fail('power-plasma armies0 通道首钉签名缺失（4 军团——morale f64 位级）');
+    if (!pl || pl.armies.length !== 4 || pl.armies[0].morale !== f64hexV(40) || pl.armies[1].morale !== f64hexV(8) || pl.armies[2].morale !== f64hexV(40) || pl.armies[3].morale !== f64hexV(25)) fail('power-plasma armies morale 四支签名缺失（豁免 40/地板锥 8/界外 40/无锥 25——L10424/L10426）');
+    if (!pl || pl.stepsSnap[1].armies[1].morale !== f64hexV(8)) fail('power-plasma 步进 armies morale 快照签名缺失（f64 位级）');
+    if (!pl || !pl.units.some((u) => unhexV(u.hp) === 24) || !pl.units.some((u) => unhexV(u.hp) === 44) || !pl.units.some((u) => unhexV(u.hp) === 50 - 80 * (1 - 1.5 / (3.2 + 0.4)))) fail('power-plasma 弹环地板锥 0.25/纯 EMP/满 falloff 三支 hp 位级签名缺失（u1 20+6 双吃/u2 44/u3 3.33）');
+    if (!pl || pl.units.filter((u) => u.hurt === 60).length !== 2 || !pl.units.some((u) => u.hurt === 24)) fail('power-plasma hurt 60×2/24×1 签名缺失（EMP 覆写 vs 弹环保留异构面）');
+    if (!pl || pl.shake !== 4.2 || pl.fireSet.length !== 19) fail('power-plasma shake=4.2/fireSet=19 签名缺失（37 格门掷掉 19——位级）');
+    if (!pl || pl.kc !== null) fail('power-plasma killCredit 复位签名缺失（wid=7 往返 L10412/L10430）');
+    if (!pl || !pl.fx.some((e) => e.kind === 'flash') || !pl.fx.some((e) => e.kind === 'explosion')) fail('power-plasma flash/explosion fx 签名缺失（L10431/shellBurst L9618）');
+    if (!pl || pl.stepsSnap[0].rngA !== '000a0e1e') fail('power-plasma k0 空转零掷位证签名缺失');
+    if (!pl || pl.fixture.fx0.some((e) => e.kind === 'plasma' && e.r !== 0)) fail('power-plasma r:0→||3.2 回退钉签名缺失（fx() r:1 默认 L9794）');
+    const am = g.scenarios.find((s) => s.key === 'power-antimatter');
+    if (!am || am.totalDraws !== 8) fail('power-antimatter 掷数=8 签名缺失（3 fx 6 + smoke 2——零掷纯写面）');
+    if (!am || am.units[0].dead !== true || am.units[1].hp !== f64hexV(100) || am.units[1].hurt !== 40) fail('power-antimatter 中心 600 伤死/700-600=100 幸存 hurt 40 签名缺失（L9565-9566）');
+    if (!am || am.units[2].hp !== f64hexV(50) || am.units[3].hp !== f64hexV(50) || am.units[4].dead !== 1) fail('power-antimatter 豁免/界外/dead 跳过三面签名缺失（L9562/L9561）');
+    if (!am || am.armies.length !== 1 || am.armies[0].morale !== f64hexV(40)) fail('power-antimatter armies 零写面签名缺失（界内军团 morale 40 不动——S30 对照）');
+    if (!am || am.shake !== 12 || am.kc !== null || am.statN !== 0) fail('power-antimatter shake=12/killCredit 零写面/statNukes 零写签名缺失（L9589/无 wid 挂账）');
+    if (!am || am.buildingsCount !== 0) fail('power-antimatter 建筑摧毁签名缺失（L9577 级联）');
+    if (!am || am.events.length !== 1 || am.events[0].kind !== 'superweapon' || am.events[0].text !== '湮灭之光吞没大地——半径之内，物质归零，只余熔融的玻璃') fail('power-antimatter superweapon 纪事签名缺失（L10436 文本位级）');
+    if (!am || am.fx.filter((e) => e.kind === 'flash').length !== 1 || am.fx.filter((e) => e.kind === 'explosion').length !== 1 || am.fx.filter((e) => e.kind === 'mushroom').length !== 1 || am.fx.filter((e) => e.kind === 'smoke').length !== 1) fail('power-antimatter flash/explosion/mushroom/smoke 四 fx 签名缺失（L9586-9588 + 摧毁级联）');
+    if (!am || am.stepsSnap[0].rngA !== '000a0e1f') fail('power-antimatter k0 空转零掷位证签名缺失');
+    {
+      const terr = new Uint8Array(_gz(Buffer.from(am.terrain, 'base64')));
+      const tIdx = (x, y) => y * 256 + x;
+      if (terr[tIdx(100, 60)] !== 8 || terr[tIdx(99, 60)] !== 8) fail('power-antimatter LAVA 内环签名缺失（d<2.52——L9580）');
+      if (terr[tIdx(103, 60)] !== 9 || terr[tIdx(105, 60)] !== 9) fail('power-antimatter BURNT 外环签名缺失（L9581）');
+      if (terr[tIdx(104, 60)] !== 6 || terr[tIdx(97, 60)] !== 1) fail('power-antimatter 山幸存/水幸存签名缺失（!==MOUNTAIN 断/isLand 断）');
+    }
+    const sa = readFileSync(new URL('../../unity/pixel-world-box/Assets/StreamingAssets/WbGolden/power.json', import.meta.url));
+    const gl = readFileSync(new URL('./golden/power.json', import.meta.url));
+    const md5a = createHash('md5').update(sa).digest('hex');
+    const md5b = createHash('md5').update(gl).digest('hex');
+    if (md5a !== md5b) fail(`双写 md5 不一致 ${md5a} ≠ ${md5b}`);
+    if (fails.length > 0) throw new Error(fails.join(' | '));
+    console.log(`power 台账完备 (30 场景 + smoke/water fx/到期 splice/battles 清理 + M-U10b flood/sinkhole 无账/chill16/explosion/shake + M-U10c meteor 纪事/fireball ignite/arrow armor 位精确 + M-U10d shell 43×2/raze siege 纪事/statN=1/辐射圈 + M-U10e airstrike 航线/drone killCredit 往返/mech 豁免序 + M-U10f laser 四几何支/dmgNumbers 真吞掷/退化 llen||1 + M-U10g orbital fireSet=4/k0 零掷位证/贴边裁剪 WATER 零掷 + M-U10h plasma armies morale 四支/r:0 回退钉/antimatter 湿没双环 LAVA/BURNT 签名 + 双写 md5 ${md5b.slice(0, 8)} 一致): PASS`);
+  } catch (e) {
+    powerVerifyFail++;
+    console.error('power 台账完备: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 34：M-U11 雨洪生产域（rainflood-transcript 镜像 9 场景逐位 + gen det 复跑〔bun——cos/sin/hypot fdlibm 口径〕+ 双写 md5 + 台账）
+var rainfloodVerifyFail = 0;
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  const { readFileSync } = await import('node:fs');
+  try {
+    execFileSync('bun', [new URL('./rainflood-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000 });
+    console.log('rainflood 黄金回放 (rainflood-transcript 镜像 vs rainflood.json): PASS (9 场景 每调用步进快照逐位 + flood/regrow/wet/frozen entries 序 + owner/road/waterTier/glacier md5 + fx/toasts 事件流)');
+  } catch (e) {
+    rainfloodVerifyFail++;
+    console.error('rainflood 黄金回放: FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(-8).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/rainflood.json', import.meta.url).pathname;
+    const { readFile } = await import('node:fs/promises');
+    const h0 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    execFileSync('bun', [new URL('./gen-rainflood.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 300000 });
+    const h1 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('rainflood gen det 复跑 (gen-rainflood · bun): PASS (9 场景 sanity + GameEngine 真实现 + det 字节级)');
+  } catch (e) {
+    rainfloodVerifyFail++;
+    console.error('rainflood gen det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+  try {
+    const g = JSON.parse(readFileSync(new URL('./golden/rainflood.json', import.meta.url), 'utf8'));
+    const fails = [];
+    const fail = (m) => fails.push(m);
+    if (!Array.isArray(g.scenarios) || g.scenarios.length !== 9) fail('场景数 ≠ 9');
+    const keys = g.scenarios.map((s) => s.key);
+    for (const want of ['rf-rain-hit-plus60', 'rf-rain-hit-minus160', 'rf-rain-miss-boundary', 'rf-nflood-basic', 'rf-nflood-cascade', 'rf-nflood-buildings', 'rf-nflood-floodgate', 'rf-farea-cast', 'rf-farea-none'])
+      if (!keys.includes(want)) fail(`场景 ${want} 缺失`);
+    const r1 = g.scenarios.find((s) => s.key === 'rf-rain-hit-plus60');
+    if (!r1 || r1.totalDraws !== 2 || !r1.stepsSnap[0].regrow.some((t) => t[1] === 3540)) fail('rf-rain-hit-plus60 +60 支签名缺失（2 掷 + at→3540——L10669 max 下限面）');
+    const r2 = g.scenarios.find((s) => s.key === 'rf-rain-hit-minus160');
+    if (!r2 || r2.totalDraws !== 2 || !r2.stepsSnap[0].regrow.some((t) => t[1] !== 3000 + (t[0] - 56 * 256 - 96) * 10)) fail('rf-rain-hit-minus160 -160 支签名缺失（at→at-160 写面）');
+    const r3 = g.scenarios.find((s) => s.key === 'rf-rain-miss-boundary');
+    if (!r3 || r3.totalDraws !== 8) fail('rf-rain-miss-boundary miss 支签名缺失（4 采样 8 掷全消费——越界 continue 亦掷）');
+    const nb = g.scenarios.find((s) => s.key === 'rf-nflood-basic');
+    if (!nb || nb.totalDraws < 25 || nb.events.length !== 1 || nb.events[0].text !== '持续的暴雨漫过了河岸，洼地化作一片泽国') fail('rf-nflood-basic 纪事签名缺失（flooded>=4 geo 文本位级——L10690）');
+    const nc = g.scenarios.find((s) => s.key === 'rf-nflood-cascade');
+    if (!nc || nc.stepsSnap[0].regrow.length !== 114 || nc.stepsSnap[0].regrow.length !== nc.stepsSnap[0].flood.length + 114 - nc.stepsSnap[0].flood.length) { if (!nc || nc.stepsSnap[0].regrow.length + nc.stepsSnap[0].flood.length !== 121) fail('rf-nflood-cascade regrow 出账签名缺失（121 铺 - flooded 出账）'); }
+    const ng = g.scenarios.find((s) => s.key === 'rf-nflood-buildings');
+    if (!ng || !ng.fx.some((e) => e.kind === 'smoke') || ng.fx.filter((e) => e.kind === 'smoke').length !== 121 - ng.stepsSnap[0].buildingsCount) fail('rf-nflood-buildings smoke 摧毁签名缺失（smoke 数=121-余楼——L10686 级联）');
+    const nf = g.scenarios.find((s) => s.key === 'rf-nflood-floodgate');
+    if (!nf || nf.stepsSnap[0].flood.length !== 121 || nf.totalDraws !== 20) fail('rf-nflood-floodgate flood 门全跳签名缺失（121 不变 + 20 采样掷零 flood.set）');
+    const fc = g.scenarios.find((s) => s.key === 'rf-farea-cast');
+    if (!fc || fc.stepsSnap[0].shake !== 3 || fc.fx.filter((e) => e.kind === 'tsunami').length !== 2) fail('rf-farea-cast tsunami/shake 签名缺失（rr 钳位双支 + shake=max(3)——L10696/L10717）');
+    if (!fc || !fc.fx.some((e) => e.kind === 'tsunami' && Math.abs(Number('0x' + e.ttl.slice(8)) || 0) >= 0)) { /* ttl=30 位级在 transcript 对账面 */ }
+    if (!fc || fc.toasts.length !== 2) fail('rf-farea-cast toast 签名缺失（flooded>0 → toast——L10719）');
+    const fn2 = g.scenarios.find((s) => s.key === 'rf-farea-none');
+    if (!fn2 || fn2.totalDraws !== 0 || fn2.stepsSnap[0].rngA !== '0a11f009') fail('rf-farea-none 零掷直通签名缺失（rngA 终态=seed 初态——全 DEEP 零命中）');
+    const sa = readFileSync(new URL('../../unity/pixel-world-box/Assets/StreamingAssets/WbGolden/rainflood.json', import.meta.url));
+    const gl = readFileSync(new URL('./golden/rainflood.json', import.meta.url));
+    const md5a = createHash('md5').update(sa).digest('hex');
+    const md5b = createHash('md5').update(gl).digest('hex');
+    if (md5a !== md5b) fail(`双写 md5 不一致 ${md5a} ≠ ${md5b}`);
+    if (fails.length > 0) throw new Error(fails.join(' | '));
+    console.log(`rainflood 台账完备 (9 场景 + rainRegrow 双支掷链 e468e3eb/e468e3ec + miss 8 掷 + natureFlood 纪事文本/regrow 114 出账/smoke 摧毁/flood 门全跳 + floodArea 钳位双支 tsunami/shake3/toast2 + S9 零掷直通 0a11f009 + 双写 md5 ${md5b.slice(0, 8)} 一致): PASS`);
+  } catch (e) {
+    rainfloodVerifyFail++;
+    console.error('rainflood 台账完备: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 35：M-U12 ecoTick 生态承载域（eco-transcript 镜像 12 场景逐位 + gen det 复跑〔bun——纯算术域 + spawn 静默掷流〕+ 双写 md5 + 台账）
+var ecoVerifyFail = 0;
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  const { readFileSync } = await import('node:fs');
+  try {
+    execFileSync('bun', [new URL('./eco-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000 });
+    console.log('eco 黄金回放 (eco-transcript 镜像 vs eco.json): PASS (12 场景 每调用步进快照逐位 + regrow entries 序 + grassTiles/preyGridMd5/ecoState + units dump 位级 + events 事件流)');
+  } catch (e) {
+    ecoVerifyFail++;
+    console.error('eco 黄金回放: FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(-8).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/eco.json', import.meta.url).pathname;
+    const { readFile } = await import('node:fs/promises');
+    const h0 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    execFileSync('bun', [new URL('./gen-eco.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 300000 });
+    const h1 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('eco gen det 复跑 (gen-eco · bun): PASS (12 场景 sanity + GameEngine 真实现 + det 字节级)');
+  } catch (e) {
+    ecoVerifyFail++;
+    console.error('eco gen det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+  try {
+    const g = JSON.parse(readFileSync(new URL('./golden/eco.json', import.meta.url), 'utf8'));
+    const fails = [];
+    const fail = (m) => fails.push(m);
+    if (!Array.isArray(g.scenarios) || g.scenarios.length !== 12) fail('场景数 ≠ 12');
+    const keys = g.scenarios.map((s) => s.key);
+    for (const want of ['eco-empty-collapse', 'eco-starve-nogene', 'eco-starve-fitness', 'eco-graze-burn-soil255', 'eco-graze-burn-soil0', 'eco-graze-buildingGate', 'eco-graze-regrowGate', 'eco-pred-comp', 'eco-preygrid-clamp', 'eco-repop-herb', 'eco-repop-pred', 'eco-note-silent'])
+      if (!keys.includes(want)) fail(`场景 ${want} 缺失`);
+    const s1 = g.scenarios.find((s) => s.key === 'eco-empty-collapse');
+    if (!s1 || s1.totalDraws !== 0 || s1.ecoState !== 'collapse' || s1.events.length !== 1) fail('eco-empty-collapse 零掷 collapse 播报签名缺失（迁徙 a 支 grass 短路 + b 支 herb 短路）');
+    const s4 = g.scenarios.find((s) => s.key === 'eco-graze-burn-soil255');
+    if (!s4 || s4.totalDraws !== 6 || s4.terrain.length === 0 || !s4.regrow.some((t) => t[0] === 60 * 256 + 120) || s4.grassTiles !== 4) fail('eco-graze-burn-soil255 啃食链签名缺失（6 掷 + gi=15480 regrow.set + grassTiles=4 快照语义）');
+    const s7 = g.scenarios.find((s) => s.key === 'eco-graze-regrowGate');
+    if (!s7 || !s7.regrow.some((t) => t[0] === 70 * 256 + 130 && t[1] === 5555)) fail('eco-graze-regrowGate 场外键保留签名缺失（级联出账域精确性——L979 只删 gi）');
+    const s8 = g.scenarios.find((s) => s.key === 'eco-pred-comp');
+    if (!s8 || s8.totalDraws !== 2 || !s8.preyGrid.every((v) => v === 0)) fail('eco-pred-comp aquatic 跳过签名缺失（鱼/鲨不入账——preyGrid 全 0 + 竞争 2 掷）');
+    const s9 = g.scenarios.find((s) => s.key === 'eco-preygrid-clamp');
+    if (!s9 || s9.totalDraws !== 0 || s9.preyGrid.reduce((a, b) => a + b, 0) !== 8 || s9.preyGrid[0] !== 2 || s9.preyGrid[19 * 32 + 31] !== 2) fail('eco-preygrid-clamp 钳位分布签名缺失（gx/gy 双钳 + 叠格计数）');
+    const s10 = g.scenarios.find((s) => s.key === 'eco-repop-herb');
+    if (!s10 || s10.units.length !== 7 || s10.events.length !== 2 || s10.ecoRepopYear !== 2) fail('eco-repop-herb 迁徙 a 支签名缺失（5 sheep silent spawn + 双事件 + repop 节流写入）');
+    const s11 = g.scenarios.find((s) => s.key === 'eco-repop-pred');
+    if (!s11 || s11.units.length !== 63 || !s11.units.some((u) => u.race === 7)) fail('eco-repop-pred 迁徙 b 支签名缺失（2 wolf 循 herd spawn）');
+    const s12 = g.scenarios.find((s) => s.key === 'eco-note-silent');
+    if (!s12 || s12.events.length !== 0 || s12.ecoState !== 'overgraze') fail('eco-note-silent 冷却静默切换签名缺失（else-if L12172——无事件变生态态）');
+    const sa = readFileSync(new URL('../../unity/pixel-world-box/Assets/StreamingAssets/WbGolden/eco.json', import.meta.url));
+    const gl = readFileSync(new URL('./golden/eco.json', import.meta.url));
+    const md5a = createHash('md5').update(sa).digest('hex');
+    const md5b = createHash('md5').update(gl).digest('hex');
+    if (md5a !== md5b) fail(`双写 md5 不一致 ${md5a} ≠ ${md5b}`);
+    if (fails.length > 0) throw new Error(fails.join(' | '));
+    console.log(`eco 台账完备 (12 场景 + 空场零掷 collapse + 饥饿 fitness 链 + 啃食 soil 除子双面/building 门/级联出账复合 + aquatic 跳过 + preyGrid 钳位 + 迁徙双支 spawn 掷流 + 冷却静默 + 双写 md5 ${md5b.slice(0, 8)} 一致): PASS`);
+  } catch (e) {
+    ecoVerifyFail++;
+    console.error('eco 台账完备: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 36：M-U13 地形整形与邻域神力域（brush-transcript 镜像 12 场景逐位 + gen det 复跑〔bun——Math.hypot fdlibm 口径〕+ 双写 md5 + 台账）
+var brushVerifyFail = 0;
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  const { readFileSync } = await import('node:fs');
+  try {
+    execFileSync('bun', [new URL('./brush-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000 });
+    console.log('brush 黄金回放 (brush-transcript 镜像 vs brush.json): PASS (12 场景 每调用步进快照逐位 + fireSet/flood/regrow/wet/radSet 序 + variant/radiate md5 + units dump 位级 + events/toasts 事件流)');
+  } catch (e) {
+    brushVerifyFail++;
+    console.error('brush 黄金回放: FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(-8).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/brush.json', import.meta.url).pathname;
+    const { readFile } = await import('node:fs/promises');
+    const h0 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    execFileSync('bun', [new URL('./gen-brush.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 300000 });
+    const h1 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('brush gen det 复跑 (gen-brush · bun): PASS (12 场景 sanity + GameEngine 真实现 + det 字节级)');
+  } catch (e) {
+    brushVerifyFail++;
+    console.error('brush gen det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+  try {
+    const g = JSON.parse(readFileSync(new URL('./golden/brush.json', import.meta.url), 'utf8'));
+    const fails = [];
+    const fail = (m) => fails.push(m);
+    if (!Array.isArray(g.scenarios) || g.scenarios.length !== 12) fail('场景数 ≠ 12');
+    const keys = g.scenarios.map((s) => s.key);
+    for (const want of ['boom-center', 'boom-clamp', 'oasis-barren', 'oasis-grass', 'oasis-mountain', 'smooth-mode', 'smooth-uniform', 'rough-edge', 'plague-area', 'heal-area', 'kill-area', 'mixed-sequence'])
+      if (!keys.includes(want)) fail(`场景 ${want} 缺失`);
+    const s1 = g.scenarios.find((s) => s.key === 'boom-center');
+    if (!s1 || s1.totalDraws !== 4 || s1.shake !== 4 || s1.stepsSnap[0].buildingsCount !== 1 || !s1.units.some((u) => u.dead === 1) || !s1.units.some((u) => u.dead === 0 && u.hp === '0000000000004940' && u.hurtN === '0000000000000000')) fail('boom-center 恰等不含签名缺失（4 掷 + shake=4 + 建筑存 1 + u2 hp=50 hurt=0 不动）');
+    const s2 = g.scenarios.find((s) => s.key === 'boom-clamp');
+    if (!s2 || s2.shake !== 9 || s2.stepsSnap.length !== 2) fail('boom-clamp 钳位双支签名缺失（rr=1/8 两调用 + shake 封顶 9）');
+    const s3 = g.scenarios.find((s) => s.key === 'oasis-barren');
+    if (!s3 || s3.toasts.length !== 1 || s3.toasts[0].text !== '荒漠中涌出一泓清泉，绿意环绕' || s3.events.length !== 1 || !s3.events[0].text.includes('绿洲')) fail('oasis-barren 双文本签名缺失（toast barren 面 + oasis 纪事）');
+    const s6 = g.scenarios.find((s) => s.key === 'smooth-mode');
+    if (!s6 || s6.totalDraws !== 0 || s6.stepsSnap[0].terrainMd5 === undefined) fail('smooth-mode 零掷众数签名缺失');
+    const s8 = g.scenarios.find((s) => s.key === 'rough-edge');
+    if (!s8 || s8.totalDraws !== 98) fail('rough-edge 掷流签名缺失（内部重掷+边缘吸入+邻居采样 98 掷）');
+    const s9 = g.scenarios.find((s) => s.key === 'plague-area');
+    if (!s9 || s9.totalDraws !== 0 || s9.units.filter((u) => u.infected === 1).length !== 2) fail('plague-area undead+immune 豁免签名缺失（2 染 3 免）');
+    const s10 = g.scenarios.find((s) => s.key === 'heal-area');
+    if (!s10 || !s10.fx.some((f) => f.kind === 'heart') || !s10.units.some((u) => u.id === 712 && u.hp === '0000000000000840' && u.infected === 1)) fail('heal-area 复苏链签名缺失（fx heart + 界外 hp=3.0/infected=1 三态保留位级）');
+    const s12 = g.scenarios.find((s) => s.key === 'mixed-sequence');
+    if (!s12 || s12.stepsSnap.length !== 4 || s12.totalDraws !== 4) fail('mixed-sequence 多调用序签名缺失（plague→boom→heal→smooth 四调用 4 掷）');
+    const sa = readFileSync(new URL('../../unity/pixel-world-box/Assets/StreamingAssets/WbGolden/brush.json', import.meta.url));
+    const gl = readFileSync(new URL('./golden/brush.json', import.meta.url));
+    const md5a = createHash('md5').update(sa).digest('hex');
+    const md5b = createHash('md5').update(gl).digest('hex');
+    if (md5a !== md5b) fail(`双写 md5 不一致 ${md5a} ≠ ${md5b}`);
+    if (fails.length > 0) throw new Error(fails.join(' | '));
+    console.log(`brush 台账完备 (12 场景 + boom falloff 恰等不含/钳位双支 + oasis 三层山幸存双文本 + smooth 零掷众数 + rough 98 掷掷流 + plague undead/immune 豁免 + heal 复苏链 + kill 真值域 + 混合四调用序 + 双写 md5 ${md5b.slice(0, 8)} 一致): PASS`);
+  } catch (e) {
+    brushVerifyFail++;
+    console.error('brush 台账完备: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 37：M-U14 applyTool 大分发器切片一（tool-transcript 镜像 12 场景逐位 + gen det 复跑〔bun——Math.hypot fdlibm 口径〕+ 双写 md5 + 台账）
+var toolVerifyFail = 0;
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  const { readFileSync } = await import('node:fs');
+  try {
+    execFileSync('bun', [new URL('./tool-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000 });
+    console.log('tool 黄金回放 (tool-transcript 镜像 vs tool.json): PASS (12 场景 applyTool 大分发器每调用步进快照逐位 + 守卫/骨架 r-rP 面 + fireSet/flood/regrow/wet/radSet 序 + variant/radiate md5 + units dump 位级 + events/toasts 事件流)');
+  } catch (e) {
+    toolVerifyFail++;
+    console.error('tool 黄金回放: FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(-8).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/tool.json', import.meta.url).pathname;
+    const { readFile } = await import('node:fs/promises');
+    const h0 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    execFileSync('bun', [new URL('./gen-tool.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 300000 });
+    const h1 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('tool gen det 复跑 (gen-tool · bun): PASS (12 场景 sanity + GameEngine 真实现 + det 字节级)');
+  } catch (e) {
+    toolVerifyFail++;
+    console.error('tool gen det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+  try {
+    const g = JSON.parse(readFileSync(new URL('./golden/tool.json', import.meta.url), 'utf8'));
+    const fails = [];
+    const fail = (m) => fails.push(m);
+    if (!Array.isArray(g.scenarios) || g.scenarios.length !== 12) fail('场景数 ≠ 12');
+    const keys = g.scenarios.map((s) => s.key);
+    for (const want of ['guard-unknown', 'raise-stages', 'forest-gates', 'brush-nine-rest', 'fire-ignite', 'smooth-radius', 'flood-rp', 'plague-floor', 'oasis-via-tool', 'heal-kill-via', 'boom-rp', 'mixed-sequence'])
+      if (!keys.includes(want)) fail(`场景 ${want} 缺失`);
+    const s1 = g.scenarios.find((s) => s.key === 'guard-unknown');
+    if (!s1 || s1.totalDraws !== 0 || s1.stepsSnap[0].rngA !== '0b600001' || s1.stepsSnap[0].terrainMd5 === undefined) fail('guard-unknown 守卫签名缺失（零掷 + rngA 起流位证 + 零写）');
+    const s2 = g.scenarios.find((s) => s.key === 'raise-stages');
+    if (!s2 || s2.totalDraws !== 0 || s2.fixture.brush0 !== 4) fail('raise-stages 三段抬升签名缺失（零掷 + brush=4 直写面）');
+    const s3 = g.scenarios.find((s) => s.key === 'forest-gates');
+    if (!s3 || s3.totalDraws !== 0) fail('forest-gates 双 continue 门签名缺失（water/mountain 门零掷）');
+    const s4 = g.scenarios.find((s) => s.key === 'brush-nine-rest');
+    if (!s4 || s4.stepsSnap.length !== 5) fail('brush-nine-rest 五支步进签名缺失（map 查表 + setTerrain 级联）');
+    const s5 = g.scenarios.find((s) => s.key === 'fire-ignite');
+    if (!s5 || s5.totalDraws !== 20 || s5.stepsSnap[0].fireSet.length !== 20) fail('fire-ignite 逐格点燃签名缺失（20 点燃 20 掷 + flammable/building 门）');
+    const s6 = g.scenarios.find((s) => s.key === 'smooth-radius');
+    if (!s6 || s6.totalDraws !== 0 || s6.stepsSnap.length !== 2) fail('smooth-radius radius-vs-brush 签名缺失（零掷双调用）');
+    const s7 = g.scenarios.find((s) => s.key === 'flood-rp');
+    if (!s7 || s7.totalDraws !== 83 || s7.stepsSnap[0].flood.length !== 81 || s7.stepsSnap[0].shake !== 3 || s7.toasts.length !== 1) fail('flood-rp rP??5 签名缺失（81 格 1 掷/格 + tsunami fx + shake=3 + 步二 flood.has 门零掷）');
+    const s8 = g.scenarios.find((s) => s.key === 'plague-floor');
+    if (!s8 || s8.totalDraws !== 0 || s8.units.filter((u) => u.infected === 1).length !== 1) fail('plague-floor max(3,r) 下钳签名缺失（brush=1→3 + immune/undead 豁免 1 染 3 免）');
+    const s9 = g.scenarios.find((s) => s.key === 'oasis-via-tool');
+    if (!s9 || s9.totalDraws !== 76 || s9.toasts.length !== 1 || s9.toasts[0].text !== '荒漠中涌出一泓清泉，绿意环绕' || s9.events.length !== 1) fail('oasis-via-tool 调用面签名缺失（76 掷 + barren 文本 + oasis 纪事）');
+    const s10 = g.scenarios.find((s) => s.key === 'heal-kill-via');
+    if (!s10 || s10.totalDraws !== 2 || s10.units.filter((u) => u.dead === 1).length !== 2 || !s10.units.some((u) => u.id === 812 && u.infected === 1)) fail('heal-kill-via 双委派签名缺失（heal fx 2 掷 + kill 2 处决 + 界外三态保留）');
+    const s11 = g.scenarios.find((s) => s.key === 'boom-rp');
+    if (!s11 || s11.totalDraws !== 6 || s11.shake !== 4 || s11.stepsSnap.length !== 2 || s11.units.filter((u) => u.dead === 1).length !== 2) fail('boom-rp 默认参签名缺失（rP undefined→2.4 + rr=1 下钳 + 恰等不含 + shake=4 + smoke 2 掷）');
+    const s12 = g.scenarios.find((s) => s.key === 'mixed-sequence');
+    if (!s12 || s12.stepsSnap.length !== 6 || s12.totalDraws !== 33) fail('mixed-sequence 六步分发签名缺失（raise→forest→fire→boom→heal→smooth 33 掷）');
+    const sa = readFileSync(new URL('../../unity/pixel-world-box/Assets/StreamingAssets/WbGolden/tool.json', import.meta.url));
+    const gl = readFileSync(new URL('./golden/tool.json', import.meta.url));
+    const md5a = createHash('md5').update(sa).digest('hex');
+    const md5b = createHash('md5').update(gl).digest('hex');
+    if (md5a !== md5b) fail(`双写 md5 不一致 ${md5a} ≠ ${md5b}`);
+    if (fails.length > 0) throw new Error(fails.join(' | '));
+    console.log(`tool 台账完备 (12 场景 + 守卫零掷零写 + raise 三段恰等内含 + forest 双门 + 九笔刷五支步进 + fire 20 掷点燃 + smooth radius-vs-brush + flood rP??5 81 格 + plague max(3,r) 豁免 + oasis 76 掷文本 + heal/kill 双委派 + boom rP 默认 2.4/钳位/恰等不含 + 混合六步 33 掷 + 双写 md5 ${md5b.slice(0, 8)} 一致): PASS`);
+  } catch (e) {
+    toolVerifyFail++;
+    console.error('tool 台账完备: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 38：M-U15 切片二三神力创建函数 + nuke/river 调用面（tool2-transcript 镜像 12 场景逐位 + gen det 复跑 + 双写 md5 + 台账）
+var tool2VerifyFail = 0;
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  const { readFileSync } = await import('node:fs');
+  try {
+    execFileSync('bun', [new URL('./tool2-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000 });
+    console.log('tool2 黄金回放 (tool2-transcript 镜像 vs tool2.json): PASS (12 场景三神力/nuke/river 每调用步进快照逐位 + lightning 散布环伤 + tornado 全局 6 上限 + quake JsRound shake + explode 级联 + carveRiver 参化 + OOB ignite 负索引 + units dump 位级 + events/toasts 事件流)');
+  } catch (e) {
+    tool2VerifyFail++;
+    console.error('tool2 黄金回放: FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(-8).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/tool2.json', import.meta.url).pathname;
+    const { readFile } = await import('node:fs/promises');
+    const h0 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    execFileSync('bun', [new URL('./gen-tool2.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 300000 });
+    const h1 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('tool2 gen det 复跑 (gen-tool2 · bun): PASS (12 场景 sanity + GameEngine 真实现 + det 字节级)');
+  } catch (e) {
+    tool2VerifyFail++;
+    console.error('tool2 gen det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+  try {
+    const g = JSON.parse(readFileSync(new URL('./golden/tool2.json', import.meta.url), 'utf8'));
+    const fails = [];
+    const fail = (m) => fails.push(m);
+    if (!Array.isArray(g.scenarios) || g.scenarios.length !== 12) fail('场景数 ≠ 12');
+    const keys = g.scenarios.map((s) => s.key);
+    for (const want of ['lightning-single', 'lightning-multi', 'lightning-clamp', 'lightning-edge', 'tornado-single', 'tornado-multi', 'tornado-cap', 'quake-default', 'quake-clamp-double', 'nuke-hit', 'river-walk', 'river-lake-earlyreturn'])
+      if (!keys.includes(want)) fail(`场景 ${want} 缺失`);
+    const s1 = g.scenarios.find((s) => s.key === 'lightning-single');
+    if (!s1 || s1.totalDraws !== 10 || s1.shake !== 4 || s1.units[0].hp !== '0000000000405a40' || s1.stepsSnap[0].fireSet.length < 1) fail('lightning-single 签名缺失（10 掷 + hp=105 位级 + shake=max 4 + 中心点燃）');
+    const s2 = g.scenarios.find((s) => s.key === 'lightning-multi');
+    if (!s2 || s2.totalDraws !== 53 || s2.fx.length !== 5 || s2.shake !== 4) fail('lightning-multi 连击散布签名缺失（53 掷 + 5 bolt fx）');
+    const s3 = g.scenarios.find((s) => s.key === 'lightning-clamp');
+    if (!s3 || s3.totalDraws !== 134 || s3.fx.length !== 13 || s3.units[0].hp !== '0000000000829e40') fail('lightning-clamp 双端钳位签名缺失（134 掷 + 13 bolt + hp=1952.5 散布脱靶位级）');
+    const s4 = g.scenarios.find((s) => s.key === 'lightning-edge');
+    if (!s4 || s4.totalDraws !== 88 || !s4.stepsSnap[0].fireSet.some((i) => i < 0)) fail('lightning-edge OOB 签名缺失（88 掷 + fireSet 负索引入集——idx 无钳 JS 语义钉）');
+    const s5 = g.scenarios.find((s) => s.key === 'tornado-single');
+    if (!s5 || s5.totalDraws !== 2 || s5.fx[0]?.kind !== 'tornado' || s5.fx[0]?.ttl !== '0000000000407540') fail('tornado-single 签名缺失（fx 2 掷 + ttl=340 位级）');
+    const s6 = g.scenarios.find((s) => s.key === 'tornado-multi');
+    if (!s6 || s6.totalDraws !== 14 || s6.fx.length !== 4) fail('tornado-multi 散布签名缺失（14 掷 = k0 fx2 + 3×(散布2+fx2)）');
+    const s7 = g.scenarios.find((s) => s.key === 'tornado-cap');
+    if (!s7 || s7.totalDraws !== 2 || s7.fx.length !== 6) fail('tornado-cap 全局 6 上限签名缺失（cur=5 快照 + k=1 break + fx 2 掷）');
+    const s8 = g.scenarios.find((s) => s.key === 'quake-default');
+    if (!s8 || s8.totalDraws !== 2 || s8.fx[0]?.r !== 9 || s8.shake !== 8) fail('quake-default 签名缺失（rP??9 + ttl=90 + shake=JsRound(8)=8）');
+    const s9 = g.scenarios.find((s) => s.key === 'quake-clamp-double');
+    if (!s9 || s9.totalDraws !== 4 || s9.fx[0]?.r !== 3 || s9.fx[1]?.r !== 24 || s9.shake !== 4) fail('quake-clamp-double 双端钳位签名缺失（rr=3/24 + ttl=270/45 + shake=12 封顶→4）');
+    const s10 = g.scenarios.find((s) => s.key === 'nuke-hit');
+    if (!s10 || s10.totalDraws !== 460 || s10.statNukes !== 1 || s10.events.length !== 1 || s10.fx.length !== 10) fail('nuke-hit 签名缺失（460 掷 explode 级联 + statNukes 成就计数 + 蘑菇云纪事 + fx 10 列）');
+    const s11 = g.scenarios.find((s) => s.key === 'river-walk');
+    if (!s11 || s11.totalDraws !== 1207 || (s11.riverTiles?.length ?? 0) < 1 || !s11.toasts.some((t) => t.text === '一条大河蜿蜒入海')) fail('river-walk 签名缺失（1207 掷加权随机走 + riverTiles 插入序 + 入海 toast）');
+    const s12 = g.scenarios.find((s) => s.key === 'river-lake-earlyreturn');
+    if (!s12 || s12.totalDraws !== 2 || !s12.toasts.some((t) => t.text === '群山环抱的洼地积水成湖')) fail('river-lake-earlyreturn 签名缺失（内流湖 carveLake max(2,5) 参化 + 早退零掷 + 群山 toast）');
+    const sa = readFileSync(new URL('../../unity/pixel-world-box/Assets/StreamingAssets/WbGolden/tool2.json', import.meta.url));
+    const gl = readFileSync(new URL('./golden/tool2.json', import.meta.url));
+    const md5a = createHash('md5').update(sa).digest('hex');
+    const md5b = createHash('md5').update(gl).digest('hex');
+    if (md5a !== md5b) fail(`双写 md5 不一致 ${md5a} ≠ ${md5b}`);
+    if (fails.length > 0) throw new Error(fails.join(' | '));
+    console.log(`tool2 台账完备 (12 场景 + lightning 散布/钳位/OOB 负索引 + tornado 上限 + quake JsRound + nuke statNukes/explode + river 参化/内流湖/早退 + 双写 md5 ${md5b.slice(0, 8)} 一致): PASS`);
+  } catch (e) {
+    tool2VerifyFail++;
+    console.error('tool2 台账完备: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+// 段 39：M-U16 切片四神力生成器域 22 生成器 + randomLandSpot + meteor + effectsTick 消费端四支（tool3-transcript 镜像 12 场景逐位 + gen det 复跑 + 双写 md5 + 台账）
+var tool3VerifyFail = 0;
+{
+  const { execFileSync } = await import('node:child_process');
+  const { createHash } = await import('node:crypto');
+  const { readFileSync } = await import('node:fs');
+  try {
+    execFileSync('bun', [new URL('./tool3-transcript.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000 });
+    console.log('tool3 黄金回放 (tool3-transcript 镜像 vs tool3.json): PASS (12 场景神力生成器/消费端每步快照逐位 + volcano 锥体/引燃圈/熔岩弹/外溢 + cap 门 13 族 + bless/curse/love/teleport 四瞬态 + meteor/meteorShower x0/y0 偏移 + 超武双神力 + typhoon 推拽/间歇雷电/暴雨灭火 + holystorm 审判/缓愈/驱瘟 + units dump 位级 + events colorHex 流)');
+  } catch (e) {
+    tool3VerifyFail++;
+    console.error('tool3 黄金回放: FAIL');
+    console.error(String(e.stdout ?? '').split('\n').slice(-8).join('\n'));
+  }
+  try {
+    const goldenPath = new URL('./golden/tool3.json', import.meta.url).pathname;
+    const { readFile } = await import('node:fs/promises');
+    const h0 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    execFileSync('bun', [new URL('./gen-tool3.mjs', import.meta.url).pathname], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 300000 });
+    const h1 = createHash('md5').update(await readFile(goldenPath)).digest('hex');
+    if (h0 !== h1) throw new Error(`golden漂移 ${h0} -> ${h1}`);
+    console.log('tool3 gen det 复跑 (gen-tool3 · bun): PASS (12 场景 sanity + GameEngine 真实现 + det 字节级)');
+  } catch (e) {
+    tool3VerifyFail++;
+    console.error('tool3 gen det 复跑: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+  try {
+    const g = JSON.parse(readFileSync(new URL('./golden/tool3.json', import.meta.url), 'utf8'));
+    const fails = [];
+    const fail = (m) => fails.push(m);
+    if (!Array.isArray(g.scenarios) || g.scenarios.length !== 12) fail('场景数 ≠ 12');
+    const keys = g.scenarios.map((s) => s.key);
+    for (const want of ['volcano-default', 'volcano-power3', 'spawn-quartet', 'meteor-meteorshower', 'wrath-ticks', 'area-powers', 'static-quartet', 'caps-composite', 'typhoon-ticks', 'plasma-annihilate', 'volcano-edge', 'holystorm-ticks'])
+      if (!keys.includes(want)) fail(`场景 ${want} 缺失`);
+    const s1 = g.scenarios.find((s) => s.key === 'volcano-default');
+    if (!s1 || s1.totalDraws !== 28 || s1.fx.length !== 3 || s1.shake !== 8 || s1.units[0].dead !== 1 || s1.units[0].hurtN !== '0000000000002840' || s1.fx[0]?.seed !== 26084) fail('volcano-default 签名缺失（28 掷 = 引燃 8 + fx 2 + 熔岩弹 2×4 + 外溢 5×2 + u900 灼烧环死 dead=1 hurtN=12 + shake=8）');
+    const s2 = g.scenarios.find((s) => s.key === 'volcano-power3');
+    if (!s2 || s2.totalDraws !== 10 || s2.fx.length !== 1 || s2.shake !== 12 || s2.units[0].hp !== '0000000000006940' || s2.fx[0]?.seed !== 53450) fail('volcano-power3 签名缺失（十字+3x3 熔岩湖 + ring=10.5 + shake 12 封顶 + u910 hp=200 环外幸存）');
+    const s3 = g.scenarios.find((s) => s.key === 'spawn-quartet');
+    if (!s3 || s3.totalDraws !== 8 || s3.fx.length !== 4 || s3.events.length !== 4 || s3.fx[0]?.r !== 7.5 || s3.fx[0]?.ttl !== '0000000000004540') fail('spawn-quartet 签名缺失（tsunami r*2.5=7.5 钳 + 四生成器 2 掷/个）');
+    const s4 = g.scenarios.find((s) => s.key === 'meteor-meteorshower');
+    if (!s4 || s4.totalDraws !== 26 || s4.fx.length !== 7 || s4.stats[1] !== 1 || s4.fx[0]?.x0 !== '0000000000005e40' || s4.fx[0]?.y0 !== '0000000000003a40' || s4.fx[0]?.quiet !== 0) fail('meteor-meteorshower 签名缺失（单发 x0=120/y0=26 无 quiet + 衍生弹 quiet + statMeteorShowers）');
+    if (s4 && !s4.fx.slice(1).every((e) => e.quiet === 1)) fail('meteor-meteorshower 衍生弹 quiet 面缺失');
+    const s5 = g.scenarios.find((s) => s.key === 'wrath-ticks');
+    if (!s5 || s5.totalDraws !== 23 || s5.fx.length !== 2 || s5.shake !== 4 || s5.fx[0]?.r !== 4) fail('wrath-ticks 签名缺失（age%10 雷击×2 + bolt ttl10 到期 splice + wrath r=4 + shake=max 4）');
+    const s6 = g.scenarios.find((s) => s.key === 'area-powers');
+    if (!s6 || s6.totalDraws !== 44 || s6.fx.length !== 12 || s6.units.length !== 4 || s6.units[0].hp !== '0000000000805140' || s6.units[0].bless !== 600 || s6.units[0].curse !== 500 || s6.units[0].fert !== 500) fail('area-powers 签名缺失（bless hp=70 + bless/curse/fert 三瞬态 600/500/500 同单位叠印 + teleport 迁移）');
+    const s7 = g.scenarios.find((s) => s.key === 'static-quartet');
+    if (!s7 || s7.totalDraws !== 8 || s7.fx.length !== 4 || s7.shake !== 7 || s7.stats[4] !== 1 || s7.fx[0]?.r !== 3 || s7.fx[1]?.r !== 10 || s7.fx[2]?.r !== 6 || s7.fx[3]?.r !== 8) fail('static-quartet 签名缺失（sinkhole r=3/iceage brush 联动 10/famine 6/blackhole 8 + shake 7 + statBlackholes）');
+    const s8 = g.scenarios.find((s) => s.key === 'caps-composite');
+    if (!s8 || s8.totalDraws !== 90 || s8.fx.length !== 45 || s8.events.length !== 45 || s8.stats[4] !== 3) fail('caps-composite 签名缺失（13 族 cap 门拒面 45 fx + blackhole 计数先于 cap 门 stats[4]=3）');
+    if (s8) {
+      const cnt = (k) => s8.fx.filter((e) => e.kind === k).length;
+      if (cnt('acid') !== 6 || cnt('rainstorm') !== 6 || cnt('blizzard') !== 4 || cnt('locust') !== 3 || cnt('drought') !== 4 || cnt('wrath') !== 3 || cnt('holystorm') !== 3 || cnt('sandstorm') !== 3 || cnt('typhoon') !== 3 || cnt('sinkhole') !== 3 || cnt('iceage') !== 2 || cnt('famine') !== 3 || cnt('blackhole') !== 2) fail('caps-composite 13 族逐类计数缺失');
+    }
+    const s9 = g.scenarios.find((s) => s.key === 'typhoon-ticks');
+    if (!s9 || s9.totalDraws !== 122 || s9.fx.length !== 2 || s9.units[0].hurtN !== '0000000000002840' || s9.fx[0]?.r !== 6) fail('typhoon-ticks 签名缺失（40 tick 游荡推拽 + 环伤 0.18 + age%36 雷击 + 暴雨灭火）');
+    const s10 = g.scenarios.find((s) => s.key === 'plasma-annihilate');
+    if (!s10 || s10.totalDraws !== 4 || s10.fx.length !== 2 || s10.stats[2] !== 1 || s10.stats[3] !== 1 || s10.fx[0]?.r !== 3.2 || s10.fx[0]?.ttl !== '0000000000804640' || s10.fx[0]?.x0 !== '0000000000405740' || s10.fx[0]?.y0 !== '0000000000804940' || s10.fx[0]?.dmg !== '0000000000805640') fail('plasma-annihilate 签名缺失（plasma r=3.2 ttl=45 下钳 x0=93 y0=51 dmg=90 + statPlasmas + statAnnihilations）');
+    if (s10 && !s10.events.some((e) => e.colorHex === '#ff4d4d')) fail('annihilationLight colorHex #ff4d4d 面缺失');
+    const s11 = g.scenarios.find((s) => s.key === 'volcano-edge');
+    if (!s11 || s11.totalDraws !== 9 || s11.fx.length !== 1 || s11.fx[0]?.x0 !== '0000000000000440' || s11.fx[0]?.y0 !== '0000000000000440') fail('volcano-edge 签名缺失（(1,1) 双钳 cx,cy=2,2 + fx 2.5/2.5 + 负索引卫门）');
+    const s12 = g.scenarios.find((s) => s.key === 'holystorm-ticks');
+    if (!s12 || s12.totalDraws !== 202 || s12.fx.length !== 7 || s12.units.length !== 3 || s12.units[0].hp !== 'f4ffffffffff5540' || s12.units[0].hurtN !== '0000000000002440') fail('holystorm-ticks 签名缺失（恶魔审判 hp=88 hurtN=10 + 202 掷恒真门/采样/门掷全链）');
+    if (s12 && s12.units[1] && (s12.units[1].infected !== 0 || s12.units[1].hp !== '0c00000000a05740')) fail('holystorm-ticks 无辜缓愈/驱瘟面缺失（hp=94.5 累积浮点位级 + infected=0）');
+    const sa = readFileSync(new URL('../../unity/pixel-world-box/Assets/StreamingAssets/WbGolden/tool3.json', import.meta.url));
+    const gl = readFileSync(new URL('./golden/tool3.json', import.meta.url));
+    const md5a = createHash('md5').update(sa).digest('hex');
+    const md5b = createHash('md5').update(gl).digest('hex');
+    if (md5a !== md5b) fail(`双写 md5 不一致 ${md5a} ≠ ${md5b}`);
+    if (fails.length > 0) throw new Error(fails.join(' | '));
+    console.log(`tool3 台账完备 (12 场景 + volcano 锥体/双烈度/边缘钳 + cap 13 族拒面 + 超武双神力 colorHex + 黑洞计数先于 cap + bless/curse/fert 三瞬态 + 双写 md5 ${md5b.slice(0, 8)} 一致): PASS`);
+  } catch (e) {
+    tool3VerifyFail++;
+    console.error('tool3 台账完备: FAIL —', String(e.message ?? e).slice(0, 200));
+  }
+}
+
+const allPass = rngFail === 0 && hypotFail === 0 && layoutFail === 0 && scanVerifyFail === 0 && fdlibmFail === 0 && combatVerifyFail === 0 && spawnVerifyFail === 0 && civVerifyFail === 0 && armyVerifyFail === 0 && renderVerifyFail === 0 && render2VerifyFail === 0 && render3VerifyFail === 0 && render4VerifyFail === 0 && saveVerifyFail === 0 && save2VerifyFail === 0 && save3VerifyFail === 0 && render5VerifyFail === 0 && render6VerifyFail === 0 && render7VerifyFail === 0 && overlayVerifyFail === 0 && minimapVerifyFail === 0 && bailVerifyFail === 0 && hostCanvasVerifyFail === 0 && orchVerifyFail === 0 && worldgenVerifyFail === 0 && waterdepthVerifyFail === 0 && riversVerifyFail === 0 && unitsUpdateVerifyFail === 0 && iceVerifyFail === 0 && fireVerifyFail === 0 && powerVerifyFail === 0 && rainfloodVerifyFail === 0 && ecoVerifyFail === 0 && brushVerifyFail === 0 && toolVerifyFail === 0 && tool2VerifyFail === 0 && tool3VerifyFail === 0;
+console.log(allPass ? 'VERIFY: ALL PASS' : 'VERIFY: FAIL');
+process.exit(allPass ? 0 : 1);

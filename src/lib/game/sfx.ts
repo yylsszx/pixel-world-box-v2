@@ -1,0 +1,1365 @@
+// ============ WebAudio 音频系统 — 本地振荡器合成：SFX 库 + 环境生成式音乐，零资源文件 ============
+import type { SoundKind } from './types';
+
+/** UI 事件音类型（组件直接调用 sfx.ui()，不走世界音效通道） */
+export type UiSoundKind = 'open' | 'close' | 'tab' | 'toggle';
+
+/** 双通道音量（0-1）：master 总线 × sfx 音效通道 / music 音乐通道 */
+export interface VolumeSettings {
+  master: number;
+  sfx: number;
+  music: number;
+}
+
+/** 音乐情绪（引擎侧随昼夜/季节/战争/暂停调用 setMood；接口先就位供后续接线） */
+export interface MoodSettings {
+  /** 夜晚：只留和声垫，更稀疏更暗 */
+  night?: boolean;
+  /** 季节 0-3（春/夏/秋/冬）：根音移调 + 环境音分派（春鸟/夏蝉/秋蛩/冬风） */
+  season?: number;
+  /** 战争：和声小调进行 + 拨弦密度加倍 + 根音下移 */
+  war?: boolean;
+  /** 暂停：master 渐出静音，但调度器不停（恢复即渐回） */
+  paused?: boolean;
+}
+
+/** 音量持久化 key（JSON {master,sfx,music}） */
+const VOL_KEY = 'wb_vol';
+/** 音量缺省 */
+const DEFAULT_VOLUMES: VolumeSettings = { master: 0.5, sfx: 0.8, music: 0.5 };
+
+/** 同类音效节流间隔（毫秒），默认 90ms；成段的音乐性事件加长，防止快速重复叠成一团 */
+const PLAY_THROTTLE: Partial<Record<SoundKind, number>> = {
+  distantThunder: 2200,
+  horn: 500,
+  achieve: 300,
+  era: 700,
+  dragon: 500,
+  shield: 250,
+  coin: 90,
+  hydra: 600,
+  phoenix: 450,
+  ent: 900,
+};
+
+// ============ 环境音乐素材表（频率写死，全合成零素材） ============
+
+/** 和平进行：Dorian 色彩的小进行（Dm → F → C → Am 感觉），每和弦 3 音 */
+const PROG_CALM: number[][] = [
+  [146.83, 174.61, 220.0], // Dm（D3 F3 A3）
+  [174.61, 220.0, 261.63], // F（F3 A3 C4）
+  [130.81, 196.0, 261.63], // C（C3 G3 C4）
+  [110.0, 130.81, 164.81], // Am（A2 C3 E3）
+];
+
+/** 战争进行：和声小调色彩（E 和弦带 G# 导音）+ 空五度强力和弦，整体低沉 */
+const PROG_WAR: number[][] = [
+  [110.0, 130.81, 164.81], // Am（A2 C3 E3）
+  [87.31, 130.81, 174.61], // F 空五度（F2 C3 F3）
+  [82.41, 103.83, 164.81], // E（E2 G#2 E3 —— 和声小调特征导音）
+  [110.0, 130.81, 164.81], // Am
+];
+
+/** 季节 → 根音移调（半音）：春 0 / 夏 +2 / 秋 -1 / 冬 -2 */
+const SEASON_SHIFT: number[] = [0, 2, -1, -2];
+
+/** 拨弦音池：D 小调五声音阶（D F G A C） */
+const PENTATONIC: number[] = [146.83, 174.61, 196.0, 220.0, 261.63];
+
+/** 读取持久化音量：损坏存档（非法 JSON / 非数值 / NaN）逐字段回默认 */
+function loadVolumes(): VolumeSettings {
+  const clamp = (x: unknown, d: number): number =>
+    typeof x === 'number' && Number.isFinite(x) ? Math.min(1, Math.max(0, x)) : d;
+  try {
+    const raw = typeof localStorage === 'undefined' ? null : localStorage.getItem(VOL_KEY);
+    if (!raw) return { ...DEFAULT_VOLUMES };
+    const v = JSON.parse(raw) as Partial<VolumeSettings> | null;
+    return {
+      master: clamp(v?.master, DEFAULT_VOLUMES.master),
+      sfx: clamp(v?.sfx, DEFAULT_VOLUMES.sfx),
+      music: clamp(v?.music, DEFAULT_VOLUMES.music),
+    };
+  } catch {
+    return { ...DEFAULT_VOLUMES }; // 整条损坏：整体回默认
+  }
+}
+
+/**
+ * 音效设计（全部实时合成，走 sfxGain 通道）：
+ * - boom    爆炸/陨石撞击：白噪声 + lowpass 衰减
+ * - nuke    核爆：更长的低频噪声 + 次声轰鸣
+ * - thunder 雷击：锯齿波瞬响（频率快速下滑）+ 噪声尾巴
+ * - place   放置单位：短促方波两连音
+ * - quake   地震：低频噪声隆隆
+ * - heal    治疗：柔和上行琶音（正弦）
+ * - volcano 火山 / blizzard 暴风雪 / tsunami 海啸：噪声塑形
+ * - horn    战争号角：双支锯齿上滑齐鸣（110→220Hz）
+ * - achieve 成就达成：明亮大调上行琶音（正弦 4 音）
+ * - era     纪元跃迁：深沉钟声（正弦 + 泛音，长衰减 2s）
+ * - dragon  巨龙咆哮：低频锯齿下滑（90→45Hz）+ 噪声粗化
+ * - shield  护盾结界：正弦颤音（vibrato LFO）
+ * - coin    拾取金币：双音方波叮当（高音短促两连）
+ */
+export class SfxEngine {
+  /** AudioContext 懒创建：浏览器策略要求用户手势后才能出声 */
+  private ctx: AudioContext | null = null;
+  private master: GainNode | null = null;
+  /** 双通道总线：sfxGain（音效）/ musicGain（音乐），都汇入 master */
+  private sfxGain: GainNode | null = null;
+  private musicGain: GainNode | null = null;
+  /** 全局开关（默认开启，UI 可切换并持久化；外部直接赋值，播放/调度时被动检查） */
+  enabled = true;
+  /** 双通道音量（localStorage wb_vol 持久化，损坏容错回默认） */
+  private volumes: VolumeSettings = loadVolumes();
+  /** 同类音效节流表：8x 速度下大量爆炸时不至于爆音 */
+  private lastPlay: Partial<Record<SoundKind | 'click' | `ui:${UiSoundKind}`, number>> = {};
+
+  // ---- 环境音乐状态 ----
+  /** 音乐总开关（startMusic 置位；AudioContext 尚未就绪时先记账，ensureInit 后自动起调） */
+  private musicOn = false;
+  /** lookahead 调度器句柄（250ms 轮询，排未来 ~600ms 内的音符） */
+  private musicTimer: ReturnType<typeof setInterval> | null = null;
+  /** 下一个和弦 / 拨弦的调度时点（ctx.currentTime 域） */
+  private nextChordTime = 0;
+  private nextPluckTime = 0;
+  /** 和弦进行游标 */
+  private chordIndex = 0;
+  /** 已排音符账本（stopMusic 时统一释放） */
+  private activeMusic: Array<{ src: AudioScheduledSourceNode; nodes: AudioNode[] }> = [];
+  /** 音乐情绪（调度决策依据） */
+  private mood: Required<MoodSettings> = { night: false, season: 0, war: false, paused: false };
+  // ---- 季节环境音状态（Task 106：春鸟鸣/夏蝉噪/秋虫吟/冬风啸） ----
+  /** 下一发自然声的调度时点（ctx.currentTime 域；随音乐调度器心跳检查） */
+  private nextAmbTime = 0;
+  /** 环境音触发计数（QA 可观测：window.__wbSfx 直读） */
+  ambCount = 0;
+  /** 最近一次触发的环境音种类（'bird'|'cicada'|'cricket'|'wind'；无声时段 ''） */
+  lastAmb = '';
+  // ---- 雨声层状态（Task 107：连续天气织体，增益跟随视口雨情） ----
+  private rainSrc: AudioBufferSourceNode | null = null;
+  private rainBp: BiquadFilterNode | null = null;
+  private rainGain: GainNode | null = null;
+  /** 雨情目标（0-1，setRainLevel 记账；层未建/音乐未开时先行暂存，起调时补应用） */
+  private rainTarget = 0;
+  /** 最近应用的雨情（QA 可观测：window.__wbSfx.rainLevel 直读） */
+  rainLevel = 0;
+
+  /** 用户手势后调用：创建 AudioContext（已存在则 resume） */
+  ensureInit(): void {
+    if (typeof window === 'undefined') return;
+    if (!this.ctx) {
+      const AC = window.AudioContext;
+      if (!AC) return;
+      this.ctx = new AC();
+      // 双通道总线：sfxGain/musicGain → master → destination
+      this.master = this.ctx.createGain();
+      this.sfxGain = this.ctx.createGain();
+      this.musicGain = this.ctx.createGain();
+      this.sfxGain.connect(this.master);
+      this.musicGain.connect(this.master);
+      this.master.connect(this.ctx.destination);
+      this.applyVolumes();
+      // 音乐在 ctx 就绪前已被请求：现在补启动调度器
+      if (this.musicOn) this.startScheduler();
+    }
+    if (this.ctx.state === 'suspended') void this.ctx.resume();
+  }
+
+  private ready(): boolean {
+    return this.enabled && this.ctx !== null && this.ctx.state === 'running';
+  }
+
+  // ============ 双通道音量 API ============
+
+  /** 设置音量（0-1，字段可选，缺省保持现值）：写 localStorage 并即时生效 */
+  setVolumes(v: { master?: number; sfx?: number; music?: number }): void {
+    if (!v) return;
+    const clamp = (x: unknown, d: number): number =>
+      typeof x === 'number' && Number.isFinite(x) ? Math.min(1, Math.max(0, x)) : d;
+    this.volumes = {
+      master: clamp(v.master, this.volumes.master),
+      sfx: clamp(v.sfx, this.volumes.sfx),
+      music: clamp(v.music, this.volumes.music),
+    };
+    try {
+      localStorage.setItem(VOL_KEY, JSON.stringify(this.volumes));
+    } catch {
+      /* 隐私模式等写入失败：仅本次会话生效 */
+    }
+    this.applyVolumes();
+  }
+
+  getVolumes(): VolumeSettings {
+    return { ...this.volumes };
+  }
+
+  /** 把音量应用到节点（master 侧折算 enabled 全局静音与 paused 渐出） */
+  private applyVolumes(): void {
+    if (!this.ctx || !this.master || !this.sfxGain || !this.musicGain) return;
+    const now = this.ctx.currentTime;
+    this.sfxGain.gain.setTargetAtTime(this.volumes.sfx, now, 0.03);
+    this.musicGain.gain.setTargetAtTime(this.volumes.music, now, 0.03);
+    this.applyMasterGain();
+  }
+
+  /** master = 音量 ×（未全局静音 且 未暂停）；setTargetAtTime 实现渐出/渐回 */
+  private applyMasterGain(): void {
+    if (!this.ctx || !this.master) return;
+    const target = this.enabled && !this.mood.paused ? this.volumes.master : 0;
+    this.master.gain.setTargetAtTime(target, this.ctx.currentTime, 0.15);
+  }
+
+  // ============ 情绪接口 ============
+
+  /** 音乐情绪（仅改状态，调度器下一轮生效；paused 渐出即时生效） */
+  setMood(m: MoodSettings): void {
+    if (!m) return;
+    if (m.night !== undefined) this.mood.night = m.night;
+    if (m.war !== undefined) {
+      if (m.war !== this.mood.war) this.chordIndex = 0; // 切战争从主和弦重新起句
+      this.mood.war = m.war;
+    }
+    if (m.paused !== undefined) this.mood.paused = m.paused;
+    if (typeof m.season === 'number' && Number.isFinite(m.season)) {
+      this.mood.season = ((Math.floor(m.season) % 4) + 4) % 4;
+    }
+    this.applyMasterGain();
+  }
+
+  getMood(): Required<MoodSettings> {
+    return { ...this.mood };
+  }
+
+  // ============ 播放入口 ============
+
+  /** 播放引擎上报的世界音效（走 sfxGain 通道） */
+  play(kind: SoundKind): void {
+    if (!this.ready()) return;
+    // 同类音效节流：默认 90ms，音乐性事件按表加长（首次播放不节流）
+    const now = performance.now();
+    const last = this.lastPlay[kind];
+    if (last !== undefined && now - last < (PLAY_THROTTLE[kind] ?? 90)) return;
+    this.lastPlay[kind] = now;
+    switch (kind) {
+      case 'boom': this.boom(false); break;
+      case 'nuke': this.boom(true); break;
+      case 'thunder': this.thunder(); break;
+      case 'distantThunder': this.distantThunder(); break;
+      case 'place': this.place(); break;
+      case 'quake': this.quake(); break;
+      case 'heal': this.heal(); break;
+      case 'volcano': this.volcano(); break;
+      case 'blizzard': this.blizzard(); break;
+      case 'tsunami': this.tsunami(); break;
+      case 'horn': this.horn(); break;
+      case 'achieve': this.achieve(); break;
+      case 'era': this.era(); break;
+      case 'dragon': this.dragon(); break;
+      case 'shield': this.shield(); break;
+      case 'coin': this.coin(); break;
+      case 'hydra': this.hydra(); break;
+      case 'phoenix': this.phoenixCall(); break;
+      case 'ent': this.ent(); break;
+      case 'chrono': this.chrono(); break;
+      case 'bloom': this.bloom(); break;
+      case 'haste': this.haste(); break;
+    }
+  }
+
+  /** UI 事件音（组件直接调用，单独 60ms 节流，不走世界音效通道） */
+  ui(kind: UiSoundKind): void {
+    if (!this.ready()) return;
+    const now = performance.now();
+    const key = `ui:${kind}`;
+    const last = this.lastPlay[key];
+    if (last !== undefined && now - last < 60) return;
+    this.lastPlay[key] = now;
+    const t = this.ctx!.currentTime;
+    switch (kind) {
+      case 'open': // 上行双音
+        this.blip(392, t, 0.09, 0.08);
+        this.blip(587.33, t + 0.08, 0.1, 0.12);
+        break;
+      case 'close': // 下行双音
+        this.blip(587.33, t, 0.09, 0.08);
+        this.blip(392, t + 0.08, 0.12, 0.1);
+        break;
+      case 'tab': // 干脆滴
+        this.blip(1567.98, t, 0.05, 0.07);
+        break;
+      case 'toggle': // 咔（频率骤降的短滴）
+        this.blip(261.63, t, 0.045, 0.09, 150);
+        break;
+    }
+  }
+
+  /** UI 点击滴声（不走 90ms 世界节流，单独 60ms 节流） */
+  click(): void {
+    if (!this.ready()) return;
+    const now = performance.now();
+    const last = this.lastPlay.click;
+    if (last !== undefined && now - last < 60) return;
+    this.lastPlay.click = now;
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(1250, t);
+    osc.frequency.exponentialRampToValueAtTime(950, t + 0.05);
+    gain.gain.setValueAtTime(0.16, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.07);
+    osc.connect(gain).connect(this.sfxGain!);
+    osc.start(t);
+    osc.stop(t + 0.08);
+  }
+
+  // ============ 环境生成式音乐（lookahead 调度器，走 musicGain 通道） ============
+
+  /** 启动环境音乐（存在感极低的背景氛围，不是主题曲） */
+  startMusic(): void {
+    this.musicOn = true;
+    this.ensureInit();
+    this.startScheduler();
+  }
+
+  /** 自然雷暴远雷计数（QA 可观测：__wbSfx.dtCount） */
+  dtCount = 0;
+
+  /** 远雷：低频滚动隆隆（自然雷暴专用——与神力天雷 thunder 的近劈瞬响区分）。
+   *  走 musicGain 通道（天气环境声族，与雨声同门）：环境音乐关 = 远雷歇；
+   *  随机延迟 0.25-1.1s 模拟声速距离感；三层错峰包络（主体/滚动纹理/回响隆隆） */
+  private distantThunder(): void {
+    if (!this.musicOn || !this.ctx || !this.musicGain) return;
+    this.dtCount++;
+    const ctx = this.ctx;
+    const t = ctx.currentTime + 0.25 + Math.random() * 0.85;
+    // 主体：低频正弦扫频（95→46Hz，2.4s 滚动）
+    const osc = ctx.createOscillator();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(95, t);
+    osc.frequency.exponentialRampToValueAtTime(46, t + 2.4);
+    const og = ctx.createGain();
+    og.gain.setValueAtTime(0.0001, t);
+    og.gain.exponentialRampToValueAtTime(0.13, t + 0.18);
+    og.gain.exponentialRampToValueAtTime(0.0001, t + 2.4);
+    osc.connect(og).connect(this.musicGain);
+    osc.start(t);
+    osc.stop(t + 2.5);
+    // 滚动纹理：带通白噪声（160Hz Q0.7 慢起缓收 2.8s —— 雷声的「翻滚」质感）
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer();
+    src.loop = true;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 160;
+    bp.Q.value = 0.7;
+    const ng = ctx.createGain();
+    ng.gain.setValueAtTime(0.0001, t + 0.05);
+    ng.gain.exponentialRampToValueAtTime(0.085, t + 0.45);
+    ng.gain.exponentialRampToValueAtTime(0.0001, t + 2.8);
+    src.connect(bp).connect(ng).connect(this.musicGain);
+    src.start(t);
+    src.stop(t + 2.9);
+    // 回响隆隆：二次低频（64→38Hz，延迟 0.6s，更弱——山谷回声的远度感）
+    const osc2 = ctx.createOscillator();
+    osc2.type = 'sine';
+    osc2.frequency.setValueAtTime(64, t + 0.6);
+    osc2.frequency.exponentialRampToValueAtTime(38, t + 2.6);
+    const og2 = ctx.createGain();
+    og2.gain.setValueAtTime(0.0001, t + 0.6);
+    og2.gain.exponentialRampToValueAtTime(0.07, t + 0.85);
+    og2.gain.exponentialRampToValueAtTime(0.0001, t + 2.6);
+    osc2.connect(og2).connect(this.musicGain);
+    osc2.start(t + 0.6);
+    osc2.stop(t + 2.7);
+  }
+
+  /** 停止环境音乐：清 interval + 已排音符快速淡出释放 */
+  stopMusic(): void {
+    this.musicOn = false;
+    if (this.musicTimer) {
+      clearInterval(this.musicTimer);
+      this.musicTimer = null;
+    }
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const now = ctx.currentTime;
+    const dying = this.activeMusic;
+    this.activeMusic = [];
+    for (const rec of dying) {
+      try {
+        // 包络快速归零（已排过 stop 的节点二次 stop 会抛错，静音靠包络 + 稍后断链）
+        for (const n of rec.nodes) {
+          const p = (n as unknown as { gain?: AudioParam }).gain;
+          if (p) {
+            p.cancelScheduledValues(now);
+            p.setTargetAtTime(0.0001, now, 0.03);
+          }
+        }
+        rec.src.stop(now + 0.12);
+      } catch {
+        /* 该节点创建时已排定终点：包络归零已足够静音 */
+      }
+    }
+    // 稍后断开图：即使包络被后续调度覆盖也不再出声
+    setTimeout(() => {
+      for (const rec of dying) {
+        try {
+          rec.src.disconnect();
+          for (const n of rec.nodes) n.disconnect();
+        } catch {
+          /* 忽略已释放节点 */
+        }
+      }
+    }, 300);
+    // 相位归零：下次 startMusic 从头起句
+    this.nextChordTime = 0;
+    this.nextPluckTime = 0;
+    this.nextAmbTime = 0;
+    this.teardownRainLayer(); // 雨声层走 musicGain 通道：环境音乐关 = 雨声也歇（下次 setRainLevel 重建）
+  }
+
+  private startScheduler(): void {
+    if (this.musicTimer || !this.ctx) return;
+    const now = this.ctx.currentTime;
+    if (this.nextChordTime <= 0) this.nextChordTime = now + 0.1; // 垫先行
+    if (this.nextPluckTime <= 0) this.nextPluckTime = now + 1.5; // 拨弦稍晚，避免开场拥挤
+    if (this.nextAmbTime <= 0) this.nextAmbTime = now + 3; // 环境音更晚：和弦垫先行立氛围
+    if (this.rainTarget > 0) {
+      this.ensureRainLayer(); // 音乐起调时补建雨声层（setRainLevel 可能在音乐开启前已记账）
+      this.applyRainLevel();
+    }
+    this.musicTimer = setInterval(() => this.musicTick(), 250);
+  }
+
+  /** lookahead 心跳：补齐未来 600ms 窗口内的音符 */
+  private musicTick(): void {
+    const ctx = this.ctx;
+    if (!ctx || ctx.state !== 'running') return;
+    this.applyMasterGain(); // 被动同步 enabled 全局静音（外部直接改字段，无回调可用）
+    const now = ctx.currentTime;
+    const horizon = now + 0.6;
+    // 长时间挂起后的追赶保护：错过太多的时点直接重排到眼前
+    if (this.nextChordTime < now - 0.5) this.nextChordTime = now + 0.05;
+    if (this.nextPluckTime < now - 0.5) this.nextPluckTime = now + 0.4;
+    if (this.nextChordTime < horizon) {
+      this.scheduleChord(this.nextChordTime);
+      this.nextChordTime += this.chordDuration();
+    }
+    if (this.nextPluckTime < horizon) {
+      if (!this.mood.night) this.schedulePluck(this.nextPluckTime); // 夜晚只留垫
+      this.nextPluckTime += this.pluckRest();
+    }
+    // —— 季节环境音（Task 106）：稀疏自然声点缀音乐垫，走 musicGain 氛围通道 ——
+    // 挂起追赶保护与和弦同款；到点即触发并按返回的休止秒数轮询下一发
+    if (this.nextAmbTime < now - 0.5) this.nextAmbTime = now + 0.5;
+    if (now >= this.nextAmbTime) this.nextAmbTime = now + this.fireAmbient();
+  }
+
+  /** 当前和弦时长：和平 8s / 战争 6.5s（更不安）/ 夜晚 10s（更绵长） */
+  private chordDuration(): number {
+    return this.mood.war ? 6.5 : this.mood.night ? 10 : 8;
+  }
+
+  /** 拨弦休止：平均 3-6s 一音符；战争密度加倍（1.5-3s） */
+  private pluckRest(): number {
+    return this.mood.war ? 1.5 + Math.random() * 1.5 : 3 + Math.random() * 3;
+  }
+
+  /** 根音移调（半音 → 频率比）：季节移调 + 战争整体下移大二度 */
+  private rootShift(): number {
+    const semis = SEASON_SHIFT[this.mood.season] + (this.mood.war ? -2 : 0);
+    return Math.pow(2, semis / 12);
+  }
+
+  /** 织体 1 · 和声垫：每和弦 3 只失谐锯齿/三角 → lowpass(800-1500Hz) → 缓起(2s)缓落(3s)包络 */
+  private scheduleChord(t: number): void {
+    const ctx = this.ctx;
+    if (!ctx || !this.musicGain) return;
+    const prog = this.mood.war ? PROG_WAR : PROG_CALM;
+    const chord = prog[this.chordIndex % prog.length];
+    this.chordIndex++;
+    const shift = this.rootShift();
+    const dur = this.chordDuration();
+    const peak = this.mood.night ? 0.04 : 0.04 + Math.random() * 0.03; // 0.04-0.07，存在感极低
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = this.mood.night ? 800 : 800 + Math.random() * 700;
+    filter.Q.value = 0.6;
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0.0001, t);
+    env.gain.linearRampToValueAtTime(peak, t + 2); // attack 2s
+    env.gain.setValueAtTime(peak, t + dur);
+    env.gain.linearRampToValueAtTime(0.0001, t + dur + 3); // release 3s（与下一和弦交叠）
+    filter.connect(env);
+    env.connect(this.musicGain);
+    chord.forEach((f, i) => {
+      const osc = ctx.createOscillator();
+      osc.type = i % 2 === 0 ? 'sawtooth' : 'triangle'; // 锯齿与三角混排，更柔
+      osc.frequency.value = f * shift;
+      osc.detune.value = (Math.random() * 2 - 1) * 7; // ±7 音分微失谐
+      osc.connect(filter);
+      osc.start(t);
+      osc.stop(t + dur + 3.05);
+      this.trackMusic(osc, [filter, env]);
+    });
+  }
+
+  /** 织体 2 · 稀疏拨弦：D 小调五声 triangle + 指数衰减（0.4-1.2s），随机八度点缀 */
+  private schedulePluck(t: number): void {
+    const ctx = this.ctx;
+    if (!ctx || !this.musicGain) return;
+    const f = PENTATONIC[Math.floor(Math.random() * PENTATONIC.length)] * this.rootShift();
+    const oct = [1, 1, 2, 2, 4][Math.floor(Math.random() * 5)]; // 偶尔高两个八度提亮
+    const dur = 0.4 + Math.random() * 0.8;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.value = f * oct;
+    gain.gain.setValueAtTime(0.06 + Math.random() * 0.04, t); // 0.06-0.1
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain);
+    gain.connect(this.musicGain);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+    this.trackMusic(osc, [gain]);
+  }
+
+  /** 已排音符入账：自然结束时自动断链防泄漏 */
+  private trackMusic(src: AudioScheduledSourceNode, nodes: AudioNode[]): void {
+    const rec = { src, nodes };
+    this.activeMusic.push(rec);
+    src.onended = () => {
+      try {
+        src.disconnect();
+        for (const n of nodes) n.disconnect();
+      } catch {
+        /* 忽略已释放节点 */
+      }
+      const i = this.activeMusic.indexOf(rec);
+      if (i >= 0) this.activeMusic.splice(i, 1);
+    };
+  }
+
+  // ============ 季节环境音（Task 106：四季的自然声，走 musicGain 氛围通道） ============
+
+  /** 环境音调度门：战争/暂停不出自然声（暂停时 master 已渐出静音，省调度） */
+  private fireAmbient(): number {
+    if (this.mood.war || this.mood.paused) return 6;
+    return this.fireAmbientCore();
+  }
+
+  /** 按季节 × 昼夜分派四种声音并返回休止秒数（春夜/夏夜鸟蝉歇息 → 长休止） */
+  private fireAmbientCore(): number {
+    const s = this.mood.season;
+    const night = this.mood.night;
+    if (s === 0 && !night) { this.ambBird(); return 4 + Math.random() * 5; } // 春昼：鸟鸣 4-9s 一声
+    if (s === 1 && !night) { this.ambCicada(); return 7 + Math.random() * 8; } // 夏昼：蝉噪长鸣
+    if (s === 2 && night) { this.ambCricket(); return 3 + Math.random() * 4; } // 秋夜：虫吟正密
+    if (s === 2) { this.ambCricket(); return 12 + Math.random() * 13; } // 秋昼：暖午后偶鸣（Task 106 遗留②：9-17s 偏密改 12-25s，蟋蟀主要在黄昏后）
+    if (s === 3) { this.ambWind(); return 9 + Math.random() * 8; } // 冬：风啸昼夜不息
+    this.lastAmb = '';
+    return 7; // 春夜/夏夜：只留音乐垫
+  }
+
+  /** 开发/QA：无视战争/暂停门直发一发当前季节环境音（确定性验证用），返回触发的种类 */
+  devFireAmbient(): string {
+    if (!this.ctx || !this.musicGain) return 'no-ctx';
+    this.fireAmbientCore();
+    return this.lastAmb;
+  }
+
+  /** 春·鸟鸣：2-4 声清脆短啭（正弦 2.5-3.6kHz 快速下滑），声间隔 90-230ms，存在感低于和弦垫 */
+  private ambBird(): void {
+    const ctx = this.ctx;
+    if (!ctx || !this.musicGain) return;
+    this.lastAmb = 'bird';
+    this.ambCount++;
+    const t = ctx.currentTime + 0.02;
+    const notes = 2 + Math.floor(Math.random() * 3);
+    let st = t;
+    for (let i = 0; i < notes; i++) {
+      const f = 2500 + Math.random() * 1100;
+      const dur = 0.07 + Math.random() * 0.06;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(f, st);
+      osc.frequency.exponentialRampToValueAtTime(f * 0.72, st + dur); // 下滑啭鸣
+      gain.gain.setValueAtTime(0.0001, st);
+      // Task 107 提档 1.5x（Task 106 遗留①：0.016-0.028 存在感偏低，实机听感偏弱）
+      gain.gain.linearRampToValueAtTime(0.024 + Math.random() * 0.018, st + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, st + dur);
+      osc.connect(gain).connect(this.musicGain);
+      osc.start(st);
+      osc.stop(st + dur + 0.02);
+      st += dur + 0.09 + Math.random() * 0.14;
+    }
+  }
+
+  /** 夏·蝉噪：1.8-3.2s 带通噪声蝉鸣（5-5.8kHz 窄带 + 38-52Hz 振翅颤音 AM，慢起缓收） */
+  private ambCicada(): void {
+    const ctx = this.ctx;
+    if (!ctx || !this.musicGain) return;
+    this.lastAmb = 'cicada';
+    this.ambCount++;
+    const t = ctx.currentTime + 0.02;
+    const dur = 1.8 + Math.random() * 1.4;
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer();
+    src.loop = true;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 5000 + Math.random() * 800;
+    bp.Q.value = 6;
+    // 振翅颤音：38-52Hz LFO 调制增益（蝉腹共鸣的嗡颤）
+    const trem = ctx.createGain();
+    trem.gain.value = 0.5;
+    const lfo = ctx.createOscillator();
+    const lfoG = ctx.createGain();
+    lfo.type = 'sine';
+    lfo.frequency.value = 38 + Math.random() * 14;
+    lfoG.gain.value = 0.42;
+    lfo.connect(lfoG);
+    lfoG.connect(trem.gain);
+    const env = ctx.createGain();
+    env.gain.setValueAtTime(0.0001, t);
+    env.gain.linearRampToValueAtTime(0.045, t + 0.35); // Task 107 提档 1.5x
+    env.gain.setValueAtTime(0.045, t + dur * 0.7);
+    env.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(bp).connect(trem).connect(env).connect(this.musicGain);
+    src.start(t);
+    src.stop(t + dur + 0.05);
+    lfo.start(t);
+    lfo.stop(t + dur + 0.05);
+  }
+
+  /** 秋·虫吟：2-3 组节律脉冲（每组 3-4 个 20ms 正弦 4.1-4.5kHz，组间 250-430ms） */
+  private ambCricket(): void {
+    const ctx = this.ctx;
+    if (!ctx || !this.musicGain) return;
+    this.lastAmb = 'cricket';
+    this.ambCount++;
+    const t = ctx.currentTime + 0.02;
+    const f = 4100 + Math.random() * 400;
+    const groups = 2 + Math.floor(Math.random() * 2);
+    let st = t;
+    for (let g = 0; g < groups; g++) {
+      const pulses = 3 + Math.floor(Math.random() * 2);
+      for (let p = 0; p < pulses; p++) {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = f;
+        gain.gain.setValueAtTime(0.0001, st);
+        gain.gain.linearRampToValueAtTime(0.03, st + 0.006); // Task 107 提档 1.5x
+        gain.gain.exponentialRampToValueAtTime(0.0001, st + 0.02);
+        osc.connect(gain).connect(this.musicGain);
+        osc.start(st);
+        osc.stop(st + 0.03);
+        st += 0.042; // 脉冲节拍
+      }
+      st += 0.25 + Math.random() * 0.18; // 组间休止（蟋蟀换气）
+    }
+  }
+
+  /** 冬·风啸：2.5-4s 带通噪声慢摆呼啸（blizzard 的低音量近亲，350-1200Hz 两折慢摆） */
+  private ambWind(): void {
+    const ctx = this.ctx;
+    if (!ctx || !this.musicGain) return;
+    this.lastAmb = 'wind';
+    this.ambCount++;
+    const t = ctx.currentTime + 0.02;
+    const dur = 2.5 + Math.random() * 1.5;
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer();
+    src.loop = true;
+    src.playbackRate.value = 0.85;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.Q.value = 1.8;
+    const f0 = 320 + Math.random() * 200;
+    bp.frequency.setValueAtTime(f0, t);
+    bp.frequency.linearRampToValueAtTime(f0 * 2.4, t + dur * 0.45); // 风起：呼啸扬上去
+    bp.frequency.linearRampToValueAtTime(f0 * 1.1, t + dur); // 风落：沉沉散去
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.linearRampToValueAtTime(0.03, t + 0.5); // Task 107 提档 1.5x
+    gain.gain.setValueAtTime(0.03, t + dur * 0.65);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(bp).connect(gain).connect(this.musicGain);
+    src.start(t);
+    src.stop(t + dur + 0.05);
+  }
+
+  // ============ 雨声层（Task 107：连续天气织体，与季节环境音同走 musicGain） ============
+  // 与季节环境音（稀疏点缀、战争静默）不同：雨是天气不是「自然声部」，战争天照下雨，
+  // 故不设战争门；暂停由 master 渐出统一静音；环境音乐关 = 雨声也歇（同通道语义）。
+
+  /**
+   * 上报视口雨情（0-1）：GameCanvas 每秒级调用。懒建音频层；
+   * 音乐未开时只记账（startScheduler 起调时补建补应用）。
+   * 增益 τ=0.9s 平滑跟随——雨来渐起、雨歇渐散，与天幕雨丝的视觉节奏对齐。
+   */
+  setRainLevel(v: number): void {
+    const t = Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0;
+    this.rainTarget = t;
+    if (!this.musicOn || !this.ctx || !this.musicGain) return;
+    this.ensureRainLayer();
+    this.applyRainLevel();
+  }
+
+  /** 懒建雨声层：白噪声环 → 宽带带通（雨的中频沙沙）→ 增益（0 起步）→ musicGain */
+  private ensureRainLayer(): void {
+    const ctx = this.ctx;
+    if (!ctx || !this.musicGain || this.rainSrc) return;
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer();
+    src.loop = true;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.value = 2200;
+    bp.Q.value = 0.7; // 宽带：雨声是宽谱沙沙而非窄带嗡鸣
+    const gain = ctx.createGain();
+    gain.gain.value = 0;
+    src.connect(bp).connect(gain).connect(this.musicGain);
+    src.start();
+    this.rainSrc = src;
+    this.rainBp = bp;
+    this.rainGain = gain;
+  }
+
+  /** 雨情 → 声学参数三联动：小雨高频沙沙稀、大雨低频连绵响 */
+  private applyRainLevel(): void {
+    if (!this.ctx || !this.rainGain || !this.rainBp) return;
+    const now = this.ctx.currentTime;
+    const v = this.rainTarget;
+    this.rainGain.gain.setTargetAtTime(v * 0.032, now, 0.9);
+    this.rainBp.frequency.setTargetAtTime(3000 - v * 1400, now, 1.2); // 3000→1600Hz：雨大势沉
+    this.rainLevel = v;
+  }
+
+  /** 停音乐时拆雨声层：快淡出 + 断链防泄漏（setRainLevel 下一发会懒建新层） */
+  private teardownRainLayer(): void {
+    const src = this.rainSrc;
+    const nodes = [this.rainBp, this.rainGain];
+    this.rainSrc = null;
+    this.rainBp = null;
+    this.rainGain = null;
+    this.rainLevel = 0;
+    if (!this.ctx || !src) return;
+    const now = this.ctx.currentTime;
+    try {
+      src.stop(now + 0.25);
+    } catch {
+      /* 已停止 */
+    }
+    setTimeout(() => {
+      try {
+        src.disconnect();
+        for (const n of nodes) if (n) n.disconnect();
+      } catch {
+        /* 忽略已释放节点 */
+      }
+    }, 400);
+  }
+
+  // ============ SFX 合成（全部走 sfxGain 通道） ============
+
+  /** 生成一段白噪声 buffer（复用 0.5s） */
+  private noiseBuffer(): AudioBuffer {
+    const ctx = this.ctx!;
+    const len = Math.floor(ctx.sampleRate * 0.5);
+    const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+    return buf;
+  }
+
+  /** 简短 UI 音符：正弦（可选频率骤降做「咔」质感） */
+  private blip(f: number, st: number, dur: number, vol: number, fEnd?: number): void {
+    const ctx = this.ctx!;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(f, st);
+    if (fEnd !== undefined) osc.frequency.exponentialRampToValueAtTime(fEnd, st + dur);
+    gain.gain.setValueAtTime(vol, st);
+    gain.gain.exponentialRampToValueAtTime(0.0001, st + dur);
+    osc.connect(gain).connect(this.sfxGain!);
+    osc.start(st);
+    osc.stop(st + dur + 0.02);
+  }
+
+  /** 爆炸：白噪声 + lowpass 滤波 + 指数衰减（核弹更长更深） */
+  private boom(nuke: boolean): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    const dur = nuke ? 1.1 : 0.45;
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer();
+    src.playbackRate.value = nuke ? 0.55 : 1;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(nuke ? 900 : 1800, t);
+    filter.frequency.exponentialRampToValueAtTime(nuke ? 60 : 120, t + dur);
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(nuke ? 0.7 : 0.5, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    src.connect(filter).connect(gain).connect(this.sfxGain!);
+    src.start(t);
+    src.stop(t + dur + 0.05);
+    // 核弹追加低频轰鸣层
+    if (nuke) {
+      const osc = ctx.createOscillator();
+      const og = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(55, t);
+      osc.frequency.exponentialRampToValueAtTime(24, t + 1.0);
+      og.gain.setValueAtTime(0.5, t);
+      og.gain.exponentialRampToValueAtTime(0.001, t + 1.0);
+      osc.connect(og).connect(this.sfxGain!);
+      osc.start(t);
+      osc.stop(t + 1.05);
+    }
+  }
+
+  /** 雷击：锯齿波瞬响（频率骤降）+ 短噪声尾巴 */
+  private thunder(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(1600, t);
+    osc.frequency.exponentialRampToValueAtTime(90, t + 0.18);
+    gain.gain.setValueAtTime(0.32, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+    osc.connect(gain).connect(this.sfxGain!);
+    osc.start(t);
+    osc.stop(t + 0.24);
+    // 噪声尾巴
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer();
+    src.playbackRate.value = 0.8;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'highpass';
+    filter.frequency.value = 400;
+    const ng = ctx.createGain();
+    ng.gain.setValueAtTime(0.22, t + 0.05);
+    ng.gain.exponentialRampToValueAtTime(0.001, t + 0.4);
+    src.connect(filter).connect(ng).connect(this.sfxGain!);
+    src.start(t + 0.05);
+    src.stop(t + 0.45);
+  }
+
+  /** 放置单位：短促方波两连音（低→高） */
+  private place(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    for (let k = 0; k < 2; k++) {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'square';
+      osc.frequency.value = k === 0 ? 620 : 880;
+      const st = t + k * 0.07;
+      gain.gain.setValueAtTime(0.12, st);
+      gain.gain.exponentialRampToValueAtTime(0.001, st + 0.09);
+      osc.connect(gain).connect(this.sfxGain!);
+      osc.start(st);
+      osc.stop(st + 0.1);
+    }
+  }
+
+  /** 地震：低频噪声隆隆（bandpass 低频段） */
+  private quake(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer();
+    src.playbackRate.value = 0.5;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.setValueAtTime(140, t);
+    filter.frequency.exponentialRampToValueAtTime(60, t + 0.9);
+    filter.Q.value = 1.2;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.5, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.9);
+    src.connect(filter).connect(gain).connect(this.sfxGain!);
+    src.start(t);
+    src.stop(t + 0.95);
+  }
+
+  /** 治疗：柔和上行琶音（正弦 3 音） */
+  private heal(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    const notes = [523.25, 659.25, 783.99]; // C5 E5 G5
+    notes.forEach((f, k) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = f;
+      const st = t + k * 0.08;
+      gain.gain.setValueAtTime(0.1, st);
+      gain.gain.exponentialRampToValueAtTime(0.001, st + 0.22);
+      osc.connect(gain).connect(this.sfxGain!);
+      osc.start(st);
+      osc.stop(st + 0.24);
+    });
+  }
+
+  /** 火山：深沉隆隆 + 高频喷发裂声（噪声双层） */
+  private volcano(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    // 深层隆隆（低频噪声）
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer();
+    src.playbackRate.value = 0.4;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(200, t);
+    filter.frequency.exponentialRampToValueAtTime(50, t + 1.4);
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.6, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 1.5);
+    src.connect(filter).connect(gain).connect(this.sfxGain!);
+    src.start(t);
+    src.stop(t + 1.55);
+    // 岩浆喷发裂声（高频瞬响）
+    const src2 = ctx.createBufferSource();
+    src2.buffer = this.noiseBuffer();
+    src2.playbackRate.value = 1.6;
+    const f2 = ctx.createBiquadFilter();
+    f2.type = 'highpass';
+    f2.frequency.value = 900;
+    const g2 = ctx.createGain();
+    g2.gain.setValueAtTime(0.3, t + 0.15);
+    g2.gain.exponentialRampToValueAtTime(0.001, t + 0.8);
+    src2.connect(f2).connect(g2).connect(this.sfxGain!);
+    src2.start(t + 0.15);
+    src2.stop(t + 0.85);
+  }
+
+  /** 暴风雪：风嚎（带通滤波噪声 + 频率摆动） */
+  private blizzard(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer();
+    src.loop = true;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.Q.value = 2.5;
+    // 风嚎：频率上下摆动模拟呼啸
+    filter.frequency.setValueAtTime(600, t);
+    filter.frequency.linearRampToValueAtTime(1400, t + 0.5);
+    filter.frequency.linearRampToValueAtTime(700, t + 1.1);
+    filter.frequency.linearRampToValueAtTime(1600, t + 1.6);
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.001, t);
+    gain.gain.linearRampToValueAtTime(0.28, t + 0.4);
+    gain.gain.setValueAtTime(0.28, t + 1.2);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 2.0);
+    src.connect(filter).connect(gain).connect(this.sfxGain!);
+    src.start(t);
+    src.stop(t + 2.05);
+  }
+
+  /** 海啸：巨浪拍岸（噪声涌起→轰然拍碎） */
+  private tsunami(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer();
+    src.loop = true;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(300, t);
+    filter.frequency.linearRampToValueAtTime(2200, t + 0.9); // 涌起：由沉到亮
+    filter.frequency.exponentialRampToValueAtTime(90, t + 2.0); // 拍碎：轰然而下
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.001, t);
+    gain.gain.linearRampToValueAtTime(0.55, t + 0.9);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 2.1);
+    src.connect(filter).connect(gain).connect(this.sfxGain!);
+    src.start(t);
+    src.stop(t + 2.15);
+  }
+
+  /** 战争号角：双支锯齿上滑齐鸣（110→220Hz，第二支微失谐追入，号角感） */
+  private horn(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    for (let k = 0; k < 2; k++) {
+      const st = t + k * 0.14;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      const lp = ctx.createBiquadFilter();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(110 * (k === 1 ? 1.005 : 1), st); // 第二支微失谐
+      osc.frequency.exponentialRampToValueAtTime(220, st + 0.5);
+      lp.type = 'lowpass';
+      lp.frequency.value = 1100; // 收掉锯齿毛刺，圆号质感
+      gain.gain.setValueAtTime(0.001, st);
+      gain.gain.linearRampToValueAtTime(0.2, st + 0.08);
+      gain.gain.setValueAtTime(0.2, st + 0.45);
+      gain.gain.exponentialRampToValueAtTime(0.001, st + 0.75);
+      osc.connect(lp).connect(gain).connect(this.sfxGain!);
+      osc.start(st);
+      osc.stop(st + 0.8);
+    }
+  }
+
+  /** 成就达成：明亮大调上行琶音（正弦 C5-E5-G5-C6，尾音延长） */
+  private achieve(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    const notes = [523.25, 659.25, 783.99, 1046.5]; // C5 E5 G5 C6
+    notes.forEach((f, k) => {
+      const last = k === notes.length - 1;
+      const st = t + k * 0.09;
+      const dur = last ? 0.55 : 0.22;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = f;
+      gain.gain.setValueAtTime(last ? 0.16 : 0.11, st);
+      gain.gain.exponentialRampToValueAtTime(0.001, st + dur);
+      osc.connect(gain).connect(this.sfxGain!);
+      osc.start(st);
+      osc.stop(st + dur + 0.02);
+    });
+  }
+
+  /** 纪元跃迁：深沉钟声（正弦 + 非谐泛音，低泛音衰减更慢，余韵 ~2s） */
+  private era(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    const base = 130.81; // C3 钟基频
+    const partials: Array<[number, number]> = [
+      [1, 0.35],
+      [2.0, 0.14],
+      [2.98, 0.07],
+      [4.2, 0.04],
+    ];
+    for (const [ratio, vol] of partials) {
+      const dur = ratio === 1 ? 2.2 : Math.max(0.8, 2.2 - ratio * 0.25); // 高泛音先散
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = base * ratio;
+      gain.gain.setValueAtTime(vol, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
+      osc.connect(gain).connect(this.sfxGain!);
+      osc.start(t);
+      osc.stop(t + dur + 0.05);
+    }
+  }
+
+  /** 巨龙咆哮：低频锯齿下滑（90→45Hz）+ 带通噪声粗化（喉音摩擦感） */
+  private dragon(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    // 低频锯齿咆哮主体
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    const lp = ctx.createBiquadFilter();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(90, t);
+    osc.frequency.exponentialRampToValueAtTime(45, t + 1.3);
+    lp.type = 'lowpass';
+    lp.frequency.value = 500;
+    gain.gain.setValueAtTime(0.001, t);
+    gain.gain.linearRampToValueAtTime(0.4, t + 0.12);
+    gain.gain.setValueAtTime(0.4, t + 0.9);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 1.4);
+    osc.connect(lp).connect(gain).connect(this.sfxGain!);
+    osc.start(t);
+    osc.stop(t + 1.45);
+    // 噪声粗化层
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer();
+    src.loop = true;
+    src.playbackRate.value = 0.6;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(300, t);
+    bp.frequency.linearRampToValueAtTime(120, t + 1.2);
+    bp.Q.value = 1.5;
+    const ng = ctx.createGain();
+    ng.gain.setValueAtTime(0.18, t);
+    ng.gain.exponentialRampToValueAtTime(0.001, t + 1.2);
+    src.connect(bp).connect(ng).connect(this.sfxGain!);
+    src.start(t);
+    src.stop(t + 1.25);
+  }
+
+  /** 护盾结界：正弦颤音（5.5Hz LFO 调制载波频率，柔和起收） */
+  private shield(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = 660;
+    // vibrato LFO：频率 ±14Hz 摆动
+    const lfo = ctx.createOscillator();
+    const lfoGain = ctx.createGain();
+    lfo.frequency.value = 5.5;
+    lfoGain.gain.value = 14;
+    lfo.connect(lfoGain);
+    lfoGain.connect(osc.frequency);
+    gain.gain.setValueAtTime(0.001, t);
+    gain.gain.linearRampToValueAtTime(0.14, t + 0.06);
+    gain.gain.setValueAtTime(0.14, t + 0.5);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.75);
+    osc.connect(gain).connect(this.sfxGain!);
+    osc.start(t);
+    osc.stop(t + 0.8);
+    lfo.start(t);
+    lfo.stop(t + 0.8);
+  }
+
+  /** 拾取金币：双音方波叮当（B5→E6 高音短促两连） */
+  private coin(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    const freqs = [987.77, 1318.5]; // B5 → E6
+    freqs.forEach((f, k) => {
+      const st = t + k * 0.09;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'square';
+      osc.frequency.value = f;
+      gain.gain.setValueAtTime(0.07, st); // 方波很响，音量压低
+      gain.gain.exponentialRampToValueAtTime(0.001, st + 0.1);
+      osc.connect(gain).connect(this.sfxGain!);
+      osc.start(st);
+      osc.stop(st + 0.12);
+    });
+  }
+
+  /** 九头蛇嘶吼：双支失谐锯齿下滑（180/240→90Hz）+ 嘶气噪声 —— 比巨龙更高频更阴冷，多头的和声感 */
+  private hydra(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    // 双锯齿失谐主体（两条颈同时嘶鸣的拍频）
+    for (const [f0, f1, vol] of [[180, 88, 0.22], [242, 120, 0.16]] as const) {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      const lp = ctx.createBiquadFilter();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(f0, t);
+      osc.frequency.exponentialRampToValueAtTime(f1, t + 1.0);
+      lp.type = 'lowpass';
+      lp.frequency.value = 900;
+      gain.gain.setValueAtTime(0.001, t);
+      gain.gain.linearRampToValueAtTime(vol, t + 0.08);
+      gain.gain.setValueAtTime(vol, t + 0.6);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 1.1);
+      osc.connect(lp).connect(gain).connect(this.sfxGain!);
+      osc.start(t);
+      osc.stop(t + 1.15);
+    }
+    // 嘶气噪声层（毒雾般的白噪上滑）
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuffer();
+    src.loop = true;
+    src.playbackRate.value = 1.2;
+    const bp = ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(900, t);
+    bp.frequency.linearRampToValueAtTime(2400, t + 0.7);
+    bp.Q.value = 2.2;
+    const ng = ctx.createGain();
+    ng.gain.setValueAtTime(0.12, t);
+    ng.gain.exponentialRampToValueAtTime(0.001, t + 0.9);
+    src.connect(bp).connect(ng).connect(this.sfxGain!);
+    src.start(t);
+    src.stop(t + 0.95);
+  }
+
+  /** 时之凝滞：玻璃质下行琶音（时间变稠）+ 高频泛音反向渐强（琥珀凝结）—— 逆流的时间感 */
+  private chrono(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    // 四音下行琶音：A5 → E5 → C5 → G4（玻璃质正弦，长尾释放 —— 时间放缓的声音意象）
+    const notes = [880, 659.25, 523.25, 392];
+    for (let i = 0; i < notes.length; i++) {
+      const st = t + i * 0.11;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = notes[i];
+      gain.gain.setValueAtTime(0.001, st);
+      gain.gain.linearRampToValueAtTime(0.09, st + 0.04);
+      gain.gain.exponentialRampToValueAtTime(0.001, st + 0.85);
+      osc.connect(gain).connect(this.sfxGain!);
+      osc.start(st);
+      osc.stop(st + 0.95);
+    }
+    // 悬停泛音：高频正弦反向渐强后骤收（琥珀封存瞬间的「咔」意）
+    const hum = ctx.createOscillator();
+    const humGain = ctx.createGain();
+    hum.type = 'sine';
+    hum.frequency.value = 1318.5; // E6
+    humGain.gain.setValueAtTime(0.001, t);
+    humGain.gain.linearRampToValueAtTime(0.05, t + 0.5);
+    humGain.gain.exponentialRampToValueAtTime(0.001, t + 0.62);
+    hum.connect(humGain).connect(this.sfxGain!);
+    hum.start(t);
+    hum.stop(t + 0.7);
+  }
+
+  /** 时之奔流：五音急升跑动 G4→C5→E5→G5→C6（短促密集，快节奏冲刺的声音意象 ——
+ *  与时之凝滞的缓下行琉璃互为镜像：一个把时间拉长，一个把时间叠紧）
+ *  尾部附一道自低向高的频率扫掠（时间从耳畔呼啸而过的「嗖」意）。 */
+  private haste(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    // 五音急升跑动：G4 → C5 → E5 → G5 → C6（大三和弦冲刺上行，间距减半、尾音减半 —— 快！）
+    const notes = [392, 523.25, 659.25, 783.99, 1046.5];
+    for (let i = 0; i < notes.length; i++) {
+      const st = t + i * 0.055;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = notes[i];
+      gain.gain.setValueAtTime(0.001, st);
+      gain.gain.linearRampToValueAtTime(0.08, st + 0.025);
+      gain.gain.exponentialRampToValueAtTime(0.001, st + 0.38);
+      osc.connect(gain).connect(this.sfxGain!);
+      osc.start(st);
+      osc.stop(st + 0.42);
+    }
+    // 时间呼啸：自低向高的频率扫掠（正弦 220→1760Hz，0.45s —— 时间洪流掠过耳畔）
+    const swoosh = ctx.createOscillator();
+    const swGain = ctx.createGain();
+    swoosh.type = 'sine';
+    swoosh.frequency.setValueAtTime(220, t);
+    swoosh.frequency.exponentialRampToValueAtTime(1760, t + 0.45);
+    swGain.gain.setValueAtTime(0.001, t);
+    swGain.gain.linearRampToValueAtTime(0.045, t + 0.18);
+    swGain.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+    swoosh.connect(swGain).connect(this.sfxGain!);
+    swoosh.start(t);
+    swoosh.stop(t + 0.55);
+  }
+
+  /** 生命绽放：五声上行琶音 C5→E5→G5→C6（铃质正弦，破土生长的声音意象 —— 与时之凝滞的下行琉璃互为镜像）
+ *  尾部附一声高八度泛音（春穹降临时花苞绽开的「叮」意）。 */
+  private bloom(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    // 四音上行琶音：C5 → E5 → G5 → C6（大调三和弦上行 —— 生命拔节生长的方向）
+    const notes = [523.25, 659.25, 783.99, 1046.5];
+    for (let i = 0; i < notes.length; i++) {
+      const st = t + i * 0.1;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = notes[i];
+      gain.gain.setValueAtTime(0.001, st);
+      gain.gain.linearRampToValueAtTime(0.085, st + 0.035);
+      gain.gain.exponentialRampToValueAtTime(0.001, st + 0.8);
+      osc.connect(gain).connect(this.sfxGain!);
+      osc.start(st);
+      osc.stop(st + 0.9);
+    }
+    // 绽放泛音：C7 高频正弦渐强后轻收（花苞绽开的光感）
+    const hum = ctx.createOscillator();
+    const humGain = ctx.createGain();
+    hum.type = 'sine';
+    hum.frequency.value = 2093; // C7
+    humGain.gain.setValueAtTime(0.001, t + 0.3);
+    humGain.gain.linearRampToValueAtTime(0.04, t + 0.75);
+    humGain.gain.exponentialRampToValueAtTime(0.001, t + 0.95);
+    hum.connect(humGain).connect(this.sfxGain!);
+    hum.start(t + 0.3);
+    hum.stop(t + 1.0);
+  }
+
+  /** 树人木语：低沉三角波短哼（220→165Hz，树皮嗓音）+ 枝叶窸窣（高频带通噪声短脉冲）—— 森林守护者的吱吟 */
+  private ent(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    // 木质喉音主体：三角波下滑（老树吱呀）
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(220, t);
+    osc.frequency.exponentialRampToValueAtTime(165, t + 0.45);
+    gain.gain.setValueAtTime(0.001, t);
+    gain.gain.linearRampToValueAtTime(0.18, t + 0.09);
+    gain.gain.setValueAtTime(0.18, t + 0.35);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.6);
+    osc.connect(gain).connect(this.sfxGain!);
+    osc.start(t);
+    osc.stop(t + 0.65);
+    // 枝叶窸窣：两段高频噪声短脉冲（叶片摩擦）
+    for (const [st, dur] of [[0.05, 0.12], [0.3, 0.18]] as const) {
+      const src = ctx.createBufferSource();
+      src.buffer = this.noiseBuffer();
+      src.loop = true;
+      src.playbackRate.value = 1.6;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass';
+      bp.frequency.value = 3200;
+      bp.Q.value = 1.2;
+      const ng = ctx.createGain();
+      ng.gain.setValueAtTime(0.001, t + st);
+      ng.gain.linearRampToValueAtTime(0.05, t + st + 0.02);
+      ng.gain.exponentialRampToValueAtTime(0.001, t + st + dur);
+      src.connect(bp).connect(ng).connect(this.sfxGain!);
+      src.start(t + st);
+      src.stop(t + st + dur + 0.02);
+    }
+  }
+
+  /** 凤鸣：清亮上滑正弦双音（880→1760Hz 主体 + 纯五度泛音）+ 颤音收尾 —— 神鸟的凤鸣九天 */
+  private phoenixCall(): void {
+    const ctx = this.ctx!;
+    const t = ctx.currentTime;
+    // 主体：八度上滑正弦（火中振翼的清越）
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(880, t);
+    osc.frequency.exponentialRampToValueAtTime(1760, t + 0.5);
+    gain.gain.setValueAtTime(0.001, t);
+    gain.gain.linearRampToValueAtTime(0.16, t + 0.1);
+    gain.gain.setValueAtTime(0.16, t + 0.55);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.9);
+    osc.connect(gain).connect(this.sfxGain!);
+    osc.start(t);
+    osc.stop(t + 0.95);
+    // 纯五度泛音（1320→2640Hz，更空灵）
+    const osc2 = ctx.createOscillator();
+    const gain2 = ctx.createGain();
+    osc2.type = 'sine';
+    osc2.frequency.setValueAtTime(1318.5, t);
+    osc2.frequency.exponentialRampToValueAtTime(2637, t + 0.5);
+    gain2.gain.setValueAtTime(0.001, t);
+    gain2.gain.linearRampToValueAtTime(0.07, t + 0.14);
+    gain2.gain.exponentialRampToValueAtTime(0.001, t + 0.85);
+    osc2.connect(gain2).connect(this.sfxGain!);
+    osc2.start(t);
+    osc2.stop(t + 0.9);
+    // 颤音收尾（6.5Hz LFO，凤尾摇曳）
+    const lfo = ctx.createOscillator();
+    const lfoGain = ctx.createGain();
+    lfo.frequency.value = 6.5;
+    lfoGain.gain.value = 22;
+    lfo.connect(lfoGain);
+    lfoGain.connect(osc.frequency);
+    lfo.start(t + 0.45);
+    lfo.stop(t + 0.95);
+  }
+}
+
+/** 全局单例（仅客户端使用） */
+export const sfx = new SfxEngine();
